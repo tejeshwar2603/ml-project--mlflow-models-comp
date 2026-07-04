@@ -1,0 +1,28 @@
+[project]
+name = "enterprise-aiops-forecasting"
+version = "0.1.0"
+description = "CPU utilization forecasting pipeline with MLflow tracking and FastAPI deployment."
+dependencies = [
+    "pandas>=2.0",
+    "numpy>=1.25",
+    "scikit-learn>=1.4",
+    "statsmodels>=0.14",
+    "xgboost>=2.0",
+    "torch>=2.0",
+    "mlflow>=2.5",
+    "fastapi>=0.111",
+    "uvicorn>=0.24",
+    "pyyaml>=6.0",
+    "python-dateutil>=2.9"
+]
+
+[project.scripts]
+forecast-train = "src.forecasting.training:run_training"
+forecast-api = "src.forecasting.app:main"
+
+[build-system]
+requires = ["setuptools>=65.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

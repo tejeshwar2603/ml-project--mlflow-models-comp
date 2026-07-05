@@ -13,7 +13,8 @@ dependencies = [
     "fastapi>=0.111",
     "uvicorn>=0.24",
     "pyyaml>=6.0",
-    "python-dateutil>=2.9"
+    "python-dateutil>=2.9",
+    "openai>=1.0"
 ]
 
 [project.scripts]

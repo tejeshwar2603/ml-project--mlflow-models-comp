@@ -3,7 +3,33 @@ import logging
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import pandas as pd
-import mlflow.pyfunc
+from .chatbot import AIOpsChatbot
+
+
+FEATURE_COLUMNS = [
+    "cpu_utilization",
+    "ram_utilization",
+    "disk_utilization",
+    "network_utilization",
+    "cpu_utilization_lag_1",
+    "cpu_utilization_lag_3",
+    "cpu_utilization_lag_7",
+    "cpu_utilization_lag_14",
+    "cpu_utilization_lag_30",
+    "cpu_utilization_roll_mean_3",
+    "cpu_utilization_roll_std_3",
+    "cpu_utilization_roll_min_3",
+    "cpu_utilization_roll_max_3",
+    "cpu_utilization_roll_mean_7",
+    "cpu_utilization_roll_std_7",
+    "cpu_utilization_roll_min_7",
+    "cpu_utilization_roll_max_7",
+    "cpu_ram_ratio",
+    "cpu_disk_ratio",
+    "day_of_week",
+    "month",
+    "is_weekend",
+]
 
 
 def normalize_model_uri(uri: str) -> str:
@@ -35,17 +61,72 @@ class PredictResponse(BaseModel):
     confidence_upper: float | None = None
 
 
+class ChatRequest(BaseModel):
+    question: str
+    top_k: int = 5
+    analysis_mode: str = "general"
+    include_prediction: bool = False
+    prediction_request: PredictRequest | None = None
+    ml_output: dict | None = None
+
+
+class ChatResponse(BaseModel):
+    answer: str
+    analysis_mode: str
+    risk: dict
+    recommendation: str
+    action_plan: list[str]
+    related_incidents: list[str]
+    runbooks: list[str]
+    jira_ticket_draft: dict
+    executive_summary: str
+    sources: list[dict]
+    ml_output: dict | None = None
+
+
 def create_app(model_uri: str | None = None):
     app = FastAPI(title="CPU Forecasting API")
     logger = logging.getLogger("src.forecasting.api")
     uri = normalize_model_uri(model_uri or os.getenv("FORECAST_MODEL_URI", "models:/cpu_forecast/Production"))
     logger.info("Loading MLflow model from URI: %s", uri)
     print(f"Loading MLflow model from URI: {uri}")
+    # Import mlflow lazily so the API can start in minimal environments
+    model = None
+    load_error = None
     try:
-        model = mlflow.pyfunc.load_model(uri)
-    except Exception as exc:
+        import mlflow.pyfunc as _mlflow_pyfunc
+
+        try:
+            model = _mlflow_pyfunc.load_model(uri)
+        except Exception as exc:
+            model = None
+            load_error = str(exc)
+    except Exception:
+        # mlflow not installed or import failed; continue with model=None
         model = None
-        load_error = str(exc)
+        load_error = "mlflow not available in environment"
+    chatbot = None
+    chatbot_error = None
+    try:
+        chatbot = AIOpsChatbot(os.getenv("RAG_VECTOR_STORE_PATH", "artifacts/vector_store.pkl"))
+    except Exception as exc:
+        chatbot_error = str(exc)
+
+    @app.get("/")
+    def root():
+        return {
+            "message": "AIOps Chatbot API",
+            "status": "running",
+            "docs": "http://127.0.0.1:8001/docs",
+            "endpoints": {
+                "health": "GET /health",
+                "chat": "POST /chat",
+                "capacity_summary": "POST /llm/capacity-summary",
+                "draft_ticket": "POST /llm/draft-ticket",
+                "executive_report": "POST /llm/executive-report",
+                "root_cause": "POST /llm/root-cause",
+            },
+        }
 
     @app.get("/health")
     def health():
@@ -56,7 +137,10 @@ def create_app(model_uri: str | None = None):
         nonlocal model
         if model is None:
             raise HTTPException(status_code=500, detail=f"Model could not be loaded: {load_error}")
-        payload = pd.DataFrame([request.features])
+        missing = [col for col in FEATURE_COLUMNS if col not in request.features]
+        if missing:
+            raise HTTPException(status_code=400, detail=f"Missing feature columns: {missing}")
+        payload = pd.DataFrame([request.features])[FEATURE_COLUMNS]
         try:
             score = model.predict(payload)
             if hasattr(score, "tolist"):
@@ -72,5 +156,136 @@ def create_app(model_uri: str | None = None):
             confidence_lower=None,
             confidence_upper=None,
         )
+
+    @app.post("/chat", response_model=ChatResponse)
+    def chat(request: ChatRequest):
+        nonlocal chatbot
+        if chatbot is None:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Chatbot vector store could not be loaded: {chatbot_error}",
+            )
+        ml_output = request.ml_output
+        if request.include_prediction:
+            if request.prediction_request is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="prediction_request is required when include_prediction=true",
+                )
+            prediction = predict(request.prediction_request)
+            ml_output = prediction.model_dump()
+        try:
+            result = chatbot.answer(
+                request.question,
+                ml_output=ml_output,
+                top_k=request.top_k,
+                analysis_mode=request.analysis_mode,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return ChatResponse(**result)
+
+    @app.post("/llm/capacity-summary")
+    def capacity_summary(request: ChatRequest):
+        """Generate a capacity planning summary using the forecast and RAG."""
+        nonlocal chatbot
+        if chatbot is None:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Chatbot vector store could not be loaded: {chatbot_error}",
+            )
+        ml_output = request.ml_output
+        if request.include_prediction and request.prediction_request:
+            prediction = predict(request.prediction_request)
+            ml_output = prediction.model_dump()
+        try:
+            result = chatbot.answer(
+                request.question or "Summarize capacity planning recommendations for the next 7 days.",
+                ml_output=ml_output,
+                top_k=request.top_k,
+                analysis_mode="capacity_planning",
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return ChatResponse(**result)
+
+    @app.post("/llm/draft-ticket")
+    def draft_ticket(request: ChatRequest):
+        """Draft a Jira ticket from the forecast and RAG context."""
+        nonlocal chatbot
+        if chatbot is None:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Chatbot vector store could not be loaded: {chatbot_error}",
+            )
+        ml_output = request.ml_output
+        if request.include_prediction and request.prediction_request:
+            prediction = predict(request.prediction_request)
+            ml_output = prediction.model_dump()
+        try:
+            result = chatbot.answer(
+                request.question or "Draft a Jira ticket for this capacity issue.",
+                ml_output=ml_output,
+                top_k=request.top_k,
+                analysis_mode="jira_ticket",
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        # Return just the Jira ticket draft for convenience
+        ticket_draft = result.get("jira_ticket_draft", {})
+        return {
+            "ticket_draft": ticket_draft,
+            "risk_level": result.get("risk", {}).get("level"),
+            "recommendation": result.get("recommendation"),
+            "sources": result.get("sources", []),
+        }
+
+    @app.post("/llm/executive-report")
+    def executive_report(request: ChatRequest):
+        """Generate an executive summary from forecast and RAG."""
+        nonlocal chatbot
+        if chatbot is None:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Chatbot vector store could not be loaded: {chatbot_error}",
+            )
+        ml_output = request.ml_output
+        if request.include_prediction and request.prediction_request:
+            prediction = predict(request.prediction_request)
+            ml_output = prediction.model_dump()
+        try:
+            result = chatbot.answer(
+                request.question or "Provide an executive summary of capacity risks and recommendations.",
+                ml_output=ml_output,
+                top_k=request.top_k,
+                analysis_mode="executive_report",
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return ChatResponse(**result)
+
+    @app.post("/llm/root-cause")
+    def root_cause(request: ChatRequest):
+        """Identify likely root causes using forecast pattern and historical incidents."""
+        nonlocal chatbot
+        if chatbot is None:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Chatbot vector store could not be loaded: {chatbot_error}",
+            )
+        ml_output = request.ml_output
+        if request.include_prediction and request.prediction_request:
+            prediction = predict(request.prediction_request)
+            ml_output = prediction.model_dump()
+        try:
+            result = chatbot.answer(
+                request.question or "What is the likely root cause of this forecast pattern?",
+                ml_output=ml_output,
+                top_k=request.top_k,
+                analysis_mode="root_cause",
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return ChatResponse(**result)
 
     return app

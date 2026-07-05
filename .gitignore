@@ -1,0 +1,26 @@
+__pycache__/
+*.pyc
+.env
+*.env
+
+# Python environment
+venv/
+.venv/
+env/
+
+# Logs and runtime output
+*.log
+*.err
+mlflow.db
+
+# MLflow and generated artifact directories
+mlruns/
+artifacts/*.pkl
+artifacts/vector_store*.pkl
+artifacts/*.db
+artifacts/*.log
+artifacts/*.err
+
+# OS files
+Thumbs.db
+.DS_Store

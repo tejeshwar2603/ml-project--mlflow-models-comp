@@ -1,4 +1,5 @@
 import os
+import re
 import logging
 from pathlib import Path
 from fastapi import FastAPI, HTTPException
@@ -6,6 +7,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import pandas as pd
 from .chatbot import AIOpsChatbot, _llm_configured
+from .forecast_service import ForecastService
 from .rag import DEFAULT_VECTOR_STORE_PATH, build_vector_store_from_environment
 
 
@@ -73,6 +75,12 @@ class ChatRequest(BaseModel):
     ml_output: dict | None = None
 
 
+class ForecastRequest(BaseModel):
+    server_id: str
+    horizon_days: int = 7
+    model: str = "auto"
+
+
 class ChatResponse(BaseModel):
     answer: str
     analysis_mode: str
@@ -119,6 +127,31 @@ def create_app(model_uri: str | None = None):
         except Exception as exc:
             model = None
             load_error = str(exc)
+            # MLflow 3.x removed model-registry "stages" (Production/Staging/etc) in
+            # favor of aliases, so legacy "models:/<name>/<stage>" URIs like the
+            # default above now fail to resolve on any version. Fall back to the
+            # latest registered version so the API still starts with a usable model.
+            match = re.match(r"^models:/([^/]+)/(Production|Staging|Archived|None)$", uri)
+            if match:
+                registered_name = match.group(1)
+                try:
+                    from mlflow import MlflowClient
+
+                    client = MlflowClient()
+                    versions = client.search_model_versions(f"name='{registered_name}'")
+                    if versions:
+                        latest = max(versions, key=lambda v: int(v.version))
+                        fallback_uri = f"models:/{registered_name}/{latest.version}"
+                        model = _mlflow_pyfunc.load_model(fallback_uri)
+                        load_error = None
+                        uri = fallback_uri
+                        logger.warning(
+                            "Stage-based URI %s not resolvable under this MLflow version; loaded latest version instead: %s",
+                            match.group(0),
+                            fallback_uri,
+                        )
+                except Exception as fallback_exc:
+                    load_error = f"{load_error}; fallback to latest version also failed: {fallback_exc}"
     except Exception:
         # mlflow not installed or import failed; continue with model=None
         model = None
@@ -129,6 +162,8 @@ def create_app(model_uri: str | None = None):
         chatbot = AIOpsChatbot(vector_store_path)
     except Exception as exc:
         chatbot_error = str(exc)
+
+    forecast_service = ForecastService(xgb_model=model, xgb_load_error=load_error)
 
     @app.get("/")
     def root():
@@ -143,6 +178,10 @@ def create_app(model_uri: str | None = None):
                 "draft_ticket": "POST /llm/draft-ticket",
                 "executive_report": "POST /llm/executive-report",
                 "root_cause": "POST /llm/root-cause",
+                "servers": "GET /servers",
+                "model_metrics": "GET /models/metrics",
+                "forecast": "POST /forecast",
+                "capacity_overview": "GET /capacity-overview",
             },
             "ui": "GET /ui",
         }
@@ -158,6 +197,8 @@ def create_app(model_uri: str | None = None):
         return {
             "status": "ok",
             "model_uri": uri,
+            "forecast_model_loaded": model is not None,
+            "forecast_model_load_error": load_error,
             "llm_configured": _llm_configured(),
             "llm_provider": "grok" if grok_key else ("openai" if os.getenv("OPENAI_API_KEY") else None),
             "llm_model": llm_model,
@@ -189,6 +230,27 @@ def create_app(model_uri: str | None = None):
             confidence_lower=None,
             confidence_upper=None,
         )
+
+    @app.get("/servers")
+    def list_servers():
+        return {"servers": forecast_service.list_servers()}
+
+    @app.get("/models/metrics")
+    def model_metrics():
+        return {"models": forecast_service.model_metrics()}
+
+    @app.post("/forecast")
+    def forecast(request: ForecastRequest):
+        try:
+            return forecast_service.forecast(
+                request.server_id, horizon_days=request.horizon_days, model=request.model
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @app.get("/capacity-overview")
+    def capacity_overview(horizon_days: int = 7):
+        return {"servers": forecast_service.fleet_overview(horizon_days=horizon_days)}
 
     @app.post("/chat", response_model=ChatResponse)
     def chat(request: ChatRequest):

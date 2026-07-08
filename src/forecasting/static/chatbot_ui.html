@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>AIOps Chatbot UI</title>
+    <title>AIOps Platform</title>
     <style>
       body {
         font-family:
@@ -19,11 +19,20 @@
         color: #1f2937;
       }
       .page {
-        max-width: 960px;
+        max-width: 1080px;
         margin: 0 auto;
       }
       h1 {
-        margin-bottom: 8px;
+        margin-bottom: 4px;
+      }
+      h2 {
+        font-size: 18px;
+        margin-top: 0;
+      }
+      .subtitle {
+        color: #4b5563;
+        margin-top: 0;
+        margin-bottom: 20px;
       }
       .panel {
         background: white;
@@ -46,6 +55,8 @@
         padding: 12px;
         font-size: 14px;
         margin-top: 6px;
+        box-sizing: border-box;
+        font-family: inherit;
       }
       textarea {
         min-height: 120px;
@@ -66,6 +77,11 @@
         grid-template-columns: 1fr 1fr 1fr;
         gap: 18px;
       }
+      .row-4 {
+        display: grid;
+        grid-template-columns: 1fr 1fr 1fr 1fr;
+        gap: 18px;
+      }
       button {
         padding: 14px 22px;
         border: none;
@@ -78,6 +94,24 @@
       }
       button:hover {
         background: #4338ca;
+      }
+      button.secondary {
+        background: #eef2ff;
+        color: #4338ca;
+        padding: 8px 14px;
+        font-size: 13px;
+      }
+      button.secondary:hover {
+        background: #e0e7ff;
+      }
+      button.secondary.active {
+        background: #4338ca;
+        color: white;
+      }
+      .quick-picks {
+        display: flex;
+        gap: 8px;
+        margin-top: 6px;
       }
       .result-block {
         background: #ffffff;
@@ -99,6 +133,19 @@
         border-radius: 999px;
         font-size: 13px;
         margin-right: 8px;
+        font-weight: 600;
+      }
+      .badge.undersized {
+        background: #fee2e2;
+        color: #b91c1c;
+      }
+      .badge.oversized {
+        background: #fef3c7;
+        color: #92400e;
+      }
+      .badge.rightsized {
+        background: #dcfce7;
+        color: #166534;
       }
       pre {
         background: #f8fafc;
@@ -114,97 +161,481 @@
         font-size: 13px;
         color: #6b7280;
       }
+      /* Tabs */
+      .tabs {
+        display: flex;
+        gap: 8px;
+        margin-bottom: 20px;
+      }
+      .tab-btn {
+        padding: 10px 20px;
+        border-radius: 12px;
+        background: white;
+        color: #4b5563;
+        border: 1px solid #e5e7eb;
+        font-weight: 700;
+        cursor: pointer;
+      }
+      .tab-btn.active {
+        background: #4f46e5;
+        color: white;
+        border-color: #4f46e5;
+      }
+      .tab-panel {
+        display: none;
+      }
+      .tab-panel.active {
+        display: block;
+      }
+      /* Overview table */
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 13px;
+      }
+      th,
+      td {
+        text-align: left;
+        padding: 10px 8px;
+        border-bottom: 1px solid #eef0f4;
+      }
+      th {
+        color: #6b7280;
+        font-weight: 700;
+        text-transform: uppercase;
+        font-size: 11px;
+        letter-spacing: 0.03em;
+      }
+      tr:hover td {
+        background: #f8fafc;
+      }
+      /* Chart */
+      .chart-wrap {
+        margin-top: 12px;
+      }
+      svg.chart {
+        width: 100%;
+        height: 220px;
+        overflow: visible;
+      }
+      .chart-line {
+        fill: none;
+        stroke: #4f46e5;
+        stroke-width: 2.5;
+      }
+      .chart-area {
+        fill: rgba(79, 70, 229, 0.08);
+        stroke: none;
+      }
+      .chart-threshold {
+        stroke: #ef4444;
+        stroke-width: 1;
+        stroke-dasharray: 4 4;
+      }
+      .chart-axis-label {
+        font-size: 10px;
+        fill: #6b7280;
+      }
+      .stat-row {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 12px;
+        margin-top: 16px;
+      }
+      .stat-tile {
+        background: #f8fafc;
+        border-radius: 12px;
+        padding: 12px;
+        text-align: center;
+      }
+      .stat-tile .value {
+        font-size: 20px;
+        font-weight: 700;
+      }
+      .stat-tile .label {
+        font-size: 11px;
+        color: #6b7280;
+        text-transform: uppercase;
+      }
+      .model-card {
+        border: 1px solid #e5e7eb;
+        border-radius: 12px;
+        padding: 12px;
+        margin-top: 8px;
+      }
+      .model-card .name {
+        font-weight: 700;
+      }
+      .model-card .meta {
+        font-size: 12px;
+        color: #6b7280;
+        margin-top: 4px;
+      }
     </style>
   </head>
   <body>
     <div class="page">
-      <div class="panel">
-        <h1>AIOps Chatbot</h1>
-        <p class="smaller">
-          Ask questions about ML model outputs, capacity planning, CPU
-          utilization, forecast comparisons, and operational recommendations.
-          The answer appears below on the same page.
-        </p>
-        <form id="chat-form">
-          <label>
-            Question
-            <textarea
-              id="question"
-              placeholder="Try: Compare the CPU forecast model output with recent utilization trends..."
-              required
-            ></textarea>
-          </label>
-          <div class="row">
-            <label>
-              Analysis mode
-              <select id="analysis_mode">
-                <option value="general">General</option>
-                <option value="capacity_planning">Capacity planning</option>
-                <option value="jira_ticket">Draft Jira ticket</option>
-                <option value="executive_report">Executive report</option>
-                <option value="root_cause">Root cause</option>
-              </select>
-            </label>
-            <label>
-              Top K sources
-              <input id="top_k" type="number" min="1" max="20" value="5" />
-            </label>
-            <label>
-              <input id="include_prediction" type="checkbox" /> Include ML
-              prediction
-              <div class="smaller">
-                Send a model prediction request to the chatbot for richer CPU
-                forecast and utilization answers.
-              </div>
-            </label>
-          </div>
-          <div id="prediction-fields" class="panel hidden">
-            <h2>Prediction request</h2>
-            <div class="row">
-              <label>
-                Server ID
-                <input id="server_id" placeholder="server-123" />
-              </label>
-              <label>
-                Horizon
-                <input id="horizon" type="number" value="1" min="1" />
-              </label>
-            </div>
-            <label>
-              Feature values (JSON)
-              <textarea
-                id="features"
-                placeholder='{"cpu_utilization": 72, "ram_utilization": 63, "disk_utilization": 41, "network_utilization": 18, "day_of_week": 3, "month": 7, "is_weekend": false}'
-              ></textarea>
-              <div class="smaller">
-                Provide forecast input features if you want the chatbot to
-                include actual CPU utilization predictions.
-              </div>
-            </label>
-          </div>
-          <label>
-            Optional ML output JSON
-            <textarea
-              id="ml_output"
-              placeholder='{"cpu_utilization": 70, "forecast_trend": "increasing"}'
-            ></textarea>
-            <div class="smaller">
-              Paste an existing model output or comparison data for the chatbot
-              to reason over directly.
-            </div>
-          </label>
-          <button type="submit">Send question</button>
-        </form>
+      <h1>AIOps Platform</h1>
+      <p class="subtitle">
+        ML forecasting, rightsizing recommendations, and an AIOps assistant in
+        one place.
+      </p>
+
+      <div class="tabs">
+        <button class="tab-btn active" data-tab="dashboard">
+          Forecast Dashboard
+        </button>
+        <button class="tab-btn" data-tab="chatbot">AIOps Chatbot</button>
       </div>
 
-      <div id="result-container"></div>
+      <!-- ================= DASHBOARD TAB ================= -->
+      <div id="tab-dashboard" class="tab-panel active">
+        <div class="panel">
+          <h2>Fleet overview</h2>
+          <p class="smaller">
+            Peak/average predicted CPU per server over the selected horizon,
+            using the last trained batch forecast, with an instant rightsizing
+            verdict for every server.
+          </p>
+          <div class="row">
+            <label>
+              Horizon (days)
+              <input id="overview-horizon" type="number" min="1" max="30" value="7" />
+            </label>
+            <label style="align-self: end">
+              <button type="button" id="overview-refresh">Refresh overview</button>
+            </label>
+          </div>
+          <div id="overview-container">
+            <p class="smaller">Loading fleet overview...</p>
+          </div>
+        </div>
+
+        <div class="panel">
+          <h2>Run a live forecast</h2>
+          <p class="smaller">
+            Picks a real model (ARIMA/SARIMA refit on the fly, or the
+            registered XGBoost model with a recursive multi-day loop) and
+            calls the ML backend for a fresh forecast every time.
+          </p>
+          <div class="row">
+            <label>
+              Server
+              <select id="forecast-server"></select>
+            </label>
+            <label>
+              Model
+              <select id="forecast-model">
+                <option value="auto">Auto (recommended)</option>
+                <option value="xgboost">XGBoost</option>
+                <option value="arima">ARIMA</option>
+                <option value="sarima">SARIMA</option>
+              </select>
+            </label>
+          </div>
+          <label>
+            Horizon: <span id="horizon-value">7</span> day(s)
+            <input id="forecast-horizon" type="range" min="1" max="90" value="7" />
+          </label>
+          <div class="quick-picks">
+            <button type="button" class="secondary" data-days="7">1 week</button>
+            <button type="button" class="secondary" data-days="30">1 month</button>
+            <button type="button" class="secondary" data-days="60">2 months</button>
+            <button type="button" class="secondary" data-days="90">3 months</button>
+          </div>
+          <div style="margin-top: 18px">
+            <button type="button" id="run-forecast">Run forecast</button>
+          </div>
+          <div id="forecast-status" class="smaller"></div>
+          <div id="forecast-result" class="chart-wrap"></div>
+        </div>
+
+        <div class="panel">
+          <h2>Model guide</h2>
+          <p class="smaller">
+            Which model performs best depends on how much history is
+            available and how many signals matter. "Auto" applies this
+            automatically per server.
+          </p>
+          <div id="model-metrics"></div>
+        </div>
+      </div>
+
+      <!-- ================= CHATBOT TAB ================= -->
+      <div id="tab-chatbot" class="tab-panel">
+        <div class="panel">
+          <h2>AIOps Chatbot</h2>
+          <p class="smaller">
+            Ask questions about ML model outputs, capacity planning, CPU
+            utilization, forecast comparisons, and operational recommendations.
+            The answer appears below on the same page.
+          </p>
+          <form id="chat-form">
+            <label>
+              Question
+              <textarea
+                id="question"
+                placeholder="Try: Compare the CPU forecast model output with recent utilization trends..."
+                required
+              ></textarea>
+            </label>
+            <div class="row">
+              <label>
+                Analysis mode
+                <select id="analysis_mode">
+                  <option value="general">General</option>
+                  <option value="capacity_planning">Capacity planning</option>
+                  <option value="incident_prevention">Incident prevention</option>
+                  <option value="jira_ticket">Draft Jira ticket</option>
+                  <option value="executive_report">Executive report</option>
+                  <option value="root_cause">Root cause</option>
+                  <option value="change_impact">Change impact</option>
+                </select>
+              </label>
+              <label>
+                Top K sources
+                <input id="top_k" type="number" min="1" max="20" value="5" />
+              </label>
+              <label>
+                <input id="include_prediction" type="checkbox" /> Include ML
+                prediction
+                <div class="smaller">
+                  Send a model prediction request to the chatbot for richer CPU
+                  forecast and utilization answers.
+                </div>
+              </label>
+            </div>
+            <div id="prediction-fields" class="panel hidden">
+              <h2>Prediction request</h2>
+              <div class="row">
+                <label>
+                  Server ID
+                  <input id="server_id" placeholder="server-123" />
+                </label>
+                <label>
+                  Horizon
+                  <input id="horizon" type="number" value="1" min="1" />
+                </label>
+              </div>
+              <label>
+                Feature values (JSON)
+                <textarea
+                  id="features"
+                  placeholder='{"cpu_utilization": 72, "ram_utilization": 63, "disk_utilization": 41, "network_utilization": 18, "day_of_week": 3, "month": 7, "is_weekend": false}'
+                ></textarea>
+                <div class="smaller">
+                  Provide forecast input features if you want the chatbot to
+                  include actual CPU utilization predictions.
+                </div>
+              </label>
+            </div>
+            <label>
+              Optional ML output JSON
+              <textarea
+                id="ml_output"
+                placeholder='{"cpu_utilization": 70, "forecast_trend": "increasing"}'
+              ></textarea>
+              <div class="smaller">
+                Paste an existing model output or comparison data for the chatbot
+                to reason over directly.
+              </div>
+            </label>
+            <button type="submit">Send question</button>
+          </form>
+        </div>
+
+        <div id="result-container"></div>
+      </div>
+
       <div class="footer">
-        Built on the same AIOps chatbot API used by the backend. Use the form
-        above to ask utilization, forecasting, and model comparison questions.
+        Built on the AIOps forecasting + chatbot API. Forecasts are computed
+        live by the backend; rightsizing thresholds/costs are illustrative
+        defaults.
       </div>
     </div>
 
     <script>
+      // ---------- Tabs ----------
+      document.querySelectorAll(".tab-btn").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          document
+            .querySelectorAll(".tab-btn")
+            .forEach((b) => b.classList.remove("active"));
+          document
+            .querySelectorAll(".tab-panel")
+            .forEach((p) => p.classList.remove("active"));
+          btn.classList.add("active");
+          document.getElementById(`tab-${btn.dataset.tab}`).classList.add("active");
+        });
+      });
+
+      function statusBadge(status, label) {
+        return `<span class="badge ${status}">${label}</span>`;
+      }
+
+      // ---------- Fleet overview ----------
+      const overviewContainer = document.getElementById("overview-container");
+      const overviewHorizon = document.getElementById("overview-horizon");
+      const overviewRefresh = document.getElementById("overview-refresh");
+
+      async function loadOverview() {
+        overviewContainer.innerHTML = '<p class="smaller">Loading...</p>';
+        try {
+          const horizon = Number(overviewHorizon.value) || 7;
+          const res = await fetch(`/capacity-overview?horizon_days=${horizon}`);
+          if (!res.ok) throw new Error((await res.json().catch(() => null))?.detail || res.statusText);
+          const data = await res.json();
+          if (!data.servers?.length) {
+            overviewContainer.innerHTML = '<p class="smaller">No forecast data available.</p>';
+            return;
+          }
+          const rows = data.servers
+            .map(
+              (s) => `<tr>
+                <td>${s.server_id}</td>
+                <td>${s.peak_predicted_cpu}%</td>
+                <td>${s.avg_predicted_cpu}%</td>
+                <td>${s.cpu_cores}</td>
+                <td>${statusBadge(s.status, s.label)}</td>
+                <td>${s.action}</td>
+              </tr>`,
+            )
+            .join("");
+          overviewContainer.innerHTML = `<table>
+            <thead><tr><th>Server</th><th>Peak CPU</th><th>Avg CPU</th><th>vCPUs</th><th>Status</th><th>Recommended action</th></tr></thead>
+            <tbody>${rows}</tbody>
+          </table>`;
+        } catch (err) {
+          overviewContainer.innerHTML = `<p class="smaller" style="color:#b91c1c;">Failed to load overview: ${err.message}</p>`;
+        }
+      }
+      overviewRefresh.addEventListener("click", loadOverview);
+
+      // ---------- Server list ----------
+      const forecastServerSelect = document.getElementById("forecast-server");
+      async function loadServers() {
+        try {
+          const res = await fetch("/servers");
+          const data = await res.json();
+          forecastServerSelect.innerHTML = data.servers
+            .map(
+              (s) =>
+                `<option value="${s.server_id}">${s.server_id} (${s.cpu_cores} vCPU, currently ${s.current_cpu}%)</option>`,
+            )
+            .join("");
+        } catch (err) {
+          forecastServerSelect.innerHTML = '<option value="">Failed to load servers</option>';
+        }
+      }
+
+      // ---------- Model metrics ----------
+      async function loadModelMetrics() {
+        const container = document.getElementById("model-metrics");
+        try {
+          const res = await fetch("/models/metrics");
+          const data = await res.json();
+          container.innerHTML = data.models
+            .map(
+              (m) => `<div class="model-card">
+                <div class="name">${m.label}${m.mae !== undefined ? ` &middot; MAE ${m.mae}` : ""}${!m.live ? " &middot; batch only" : ""}</div>
+                <div class="meta">${m.description}</div>
+                <div class="meta"><strong>Best for:</strong> ${m.suited_for}</div>
+              </div>`,
+            )
+            .join("");
+        } catch (err) {
+          container.innerHTML = `<p class="smaller" style="color:#b91c1c;">Failed to load model metrics: ${err.message}</p>`;
+        }
+      }
+
+      // ---------- Horizon slider + quick picks ----------
+      const horizonSlider = document.getElementById("forecast-horizon");
+      const horizonValue = document.getElementById("horizon-value");
+      horizonSlider.addEventListener("input", () => {
+        horizonValue.textContent = horizonSlider.value;
+        document.querySelectorAll(".quick-picks .secondary").forEach((b) => b.classList.remove("active"));
+      });
+      document.querySelectorAll(".quick-picks .secondary").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          horizonSlider.value = btn.dataset.days;
+          horizonValue.textContent = btn.dataset.days;
+          document.querySelectorAll(".quick-picks .secondary").forEach((b) => b.classList.remove("active"));
+          btn.classList.add("active");
+        });
+      });
+
+      // ---------- Chart ----------
+      function renderChart(points) {
+        const width = 640;
+        const height = 200;
+        const padding = 24;
+        const values = points.map((p) => p.predicted_cpu);
+        const maxVal = Math.max(100, ...values);
+        const minVal = 0;
+        const stepX = (width - padding * 2) / Math.max(1, points.length - 1);
+        const scaleY = (v) => height - padding - ((v - minVal) / (maxVal - minVal)) * (height - padding * 2);
+
+        const linePoints = points.map((p, i) => `${padding + i * stepX},${scaleY(p.predicted_cpu)}`).join(" ");
+        const areaPoints = `${padding},${scaleY(0)} ${linePoints} ${padding + (points.length - 1) * stepX},${scaleY(0)}`;
+
+        const thresholdY = scaleY(85);
+        const firstLabel = points[0]?.date || "";
+        const lastLabel = points[points.length - 1]?.date || "";
+
+        return `<svg class="chart" viewBox="0 0 ${width} ${height + 20}">
+          <line class="chart-threshold" x1="${padding}" y1="${thresholdY}" x2="${width - padding}" y2="${thresholdY}" />
+          <text class="chart-axis-label" x="${width - padding}" y="${thresholdY - 4}" text-anchor="end">85% risk line</text>
+          <polygon class="chart-area" points="${areaPoints}" />
+          <polyline class="chart-line" points="${linePoints}" />
+          <text class="chart-axis-label" x="${padding}" y="${height + 16}">${firstLabel}</text>
+          <text class="chart-axis-label" x="${width - padding}" y="${height + 16}" text-anchor="end">${lastLabel}</text>
+        </svg>`;
+      }
+
+      // ---------- Run forecast ----------
+      const forecastStatus = document.getElementById("forecast-status");
+      const forecastResult = document.getElementById("forecast-result");
+      document.getElementById("run-forecast").addEventListener("click", async () => {
+        const server_id = forecastServerSelect.value;
+        const model = document.getElementById("forecast-model").value;
+        const horizon_days = Number(horizonSlider.value);
+        if (!server_id) {
+          forecastStatus.textContent = "Pick a server first.";
+          return;
+        }
+        forecastStatus.textContent = "Calling the ML backend...";
+        forecastResult.innerHTML = "";
+        try {
+          const res = await fetch("/forecast", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ server_id, model, horizon_days }),
+          });
+          if (!res.ok) throw new Error((await res.json().catch(() => null))?.detail || res.statusText);
+          const data = await res.json();
+          forecastStatus.textContent = `Model used: ${data.model_used}${data.model_selection_reason ? " — " + data.model_selection_reason : ""}`;
+          const rec = data.recommendation;
+          forecastResult.innerHTML = `
+            ${renderChart(data.points)}
+            <div class="stat-row">
+              <div class="stat-tile"><div class="value">${data.peak_predicted_cpu}%</div><div class="label">Peak CPU</div></div>
+              <div class="stat-tile"><div class="value">${data.avg_predicted_cpu}%</div><div class="label">Avg CPU</div></div>
+              <div class="stat-tile"><div class="value">${data.min_predicted_cpu}%</div><div class="label">Min CPU</div></div>
+              <div class="stat-tile"><div class="value">${data.cpu_cores}</div><div class="label">Current vCPUs</div></div>
+            </div>
+            <div class="result-block" style="margin-top:16px;">
+              <h2>${statusBadge(rec.status, rec.label)}</h2>
+              <p>${rec.message}</p>
+              <p><strong>Recommended action:</strong> ${rec.action}</p>
+              ${rec.estimated_monthly_cost_delta_usd ? `<p class="smaller">Illustrative monthly cost impact: ${rec.estimated_monthly_cost_delta_usd > 0 ? "+" : ""}$${rec.estimated_monthly_cost_delta_usd}</p>` : ""}
+            </div>`;
+        } catch (err) {
+          forecastStatus.textContent = "";
+          forecastResult.innerHTML = `<p class="smaller" style="color:#b91c1c;">Forecast failed: ${err.message}</p>`;
+        }
+      });
+
+      // ---------- Chatbot (existing) ----------
       const includePrediction = document.getElementById("include_prediction");
       const predictionFields = document.getElementById("prediction-fields");
       const resultContainer = document.getElementById("result-container");
@@ -311,6 +742,11 @@
           resultContainer.innerHTML = `<div class="result-block"><p style="color:#b91c1c;">Request failed: ${err.message}</p></div>`;
         }
       });
+
+      // ---------- Init ----------
+      loadOverview();
+      loadServers();
+      loadModelMetrics();
     </script>
   </body>
 </html>

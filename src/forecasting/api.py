@@ -1,9 +1,11 @@
 import os
 import re
+import io
 import json
+import uuid
 import logging
 from pathlib import Path
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import pandas as pd
@@ -80,6 +82,7 @@ class ForecastRequest(BaseModel):
     server_id: str
     horizon_days: int = 7
     model: str = "auto"
+    dataset_id: str = "synthetic"
 
 
 class ChatResponse(BaseModel):
@@ -184,6 +187,8 @@ def create_app(model_uri: str | None = None):
                 "forecast": "POST /forecast",
                 "capacity_overview": "GET /capacity-overview",
                 "model_comparison": "GET /model-comparison",
+                "datasets": "GET /datasets",
+                "upload_dataset": "POST /datasets/upload (multipart file: .xlsx/.xls/.csv)",
             },
             "ui": "GET /ui",
         }
@@ -234,18 +239,58 @@ def create_app(model_uri: str | None = None):
         )
 
     @app.get("/servers")
-    def list_servers():
-        return {"servers": forecast_service.list_servers()}
+    def list_servers(dataset_id: str = "synthetic"):
+        try:
+            return {"servers": forecast_service.list_servers(dataset_id=dataset_id)}
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
 
     @app.get("/models/metrics")
     def model_metrics():
         return {"models": forecast_service.model_metrics()}
 
+    @app.get("/datasets")
+    def list_datasets():
+        return {"datasets": forecast_service.list_datasets()}
+
+    @app.post("/datasets/upload")
+    async def upload_dataset(
+        file: UploadFile = File(...),
+        dataset_label: str | None = Form(None),
+        dataset_id: str | None = Form(None),
+    ):
+        content = await file.read()
+        filename = (file.filename or "uploaded").lower()
+        try:
+            if filename.endswith((".xlsx", ".xls")):
+                df = pd.read_excel(io.BytesIO(content))
+            elif filename.endswith(".csv"):
+                df = pd.read_csv(io.BytesIO(content))
+            else:
+                raise HTTPException(status_code=400, detail="Unsupported file type - upload .xlsx, .xls, or .csv.")
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Could not read file: {exc}")
+
+        # Pass an explicit dataset_id (e.g. "kafka-live") to upsert/replace an existing
+        # dataset in place, instead of minting a new upload-<uuid> id each call - this is
+        # what the streaming consumer uses to keep one rolling "live" dataset up to date.
+        resolved_id = dataset_id or f"upload-{uuid.uuid4().hex[:8]}"
+        label = dataset_label or file.filename or resolved_id
+        try:
+            return forecast_service.register_uploaded_dataset(resolved_id, df, label=label)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
     @app.post("/forecast")
     def forecast(request: ForecastRequest):
         try:
             return forecast_service.forecast(
-                request.server_id, horizon_days=request.horizon_days, model=request.model
+                request.server_id,
+                horizon_days=request.horizon_days,
+                model=request.model,
+                dataset_id=request.dataset_id,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))

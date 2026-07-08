@@ -394,11 +394,36 @@
         </div>
 
         <div class="panel">
+          <h2>Dataset</h2>
+          <p class="smaller">
+            Forecasts run against the built-in synthetic dataset by default.
+            Upload your own CPU/RAM/disk/network history (.xlsx, .xls, or
+            .csv) to forecast and rightsize against your own servers instead.
+            Required columns: <code>server_id, timestamp, cpu_utilization,
+            ram_utilization, disk_utilization, network_utilization</code>
+            (optional: <code>cpu_cores, installed_ram</code>).
+          </p>
+          <div class="row">
+            <label>
+              Active dataset
+              <select id="dataset-select"></select>
+            </label>
+            <label>
+              Upload dataset file
+              <input type="file" id="dataset-file" accept=".xlsx,.xls,.csv" />
+            </label>
+          </div>
+          <button type="button" id="dataset-upload-btn">Upload &amp; use this dataset</button>
+          <div id="dataset-status" class="smaller"></div>
+        </div>
+
+        <div class="panel">
           <h2>Run a live forecast</h2>
           <p class="smaller">
             Picks a real model (ARIMA/SARIMA refit on the fly, or the
             registered XGBoost model with a recursive multi-day loop) and
-            calls the ML backend for a fresh forecast every time.
+            calls the ML backend for a fresh forecast every time, against the
+            active dataset selected above.
           </p>
           <div class="row">
             <label>
@@ -700,13 +725,14 @@
                 <td>${s.peak_predicted_cpu}%</td>
                 <td>${s.avg_predicted_cpu}%</td>
                 <td>${s.cpu_cores}</td>
+                <td>${s.installed_ram_gb ?? "-"}</td>
                 <td>${statusBadge(s.status, s.label)}</td>
                 <td>${s.action}</td>
               </tr>`,
             )
             .join("");
           overviewContainer.innerHTML = `<table>
-            <thead><tr><th>Server</th><th>Peak CPU</th><th>Avg CPU</th><th>vCPUs</th><th>Status</th><th>Recommended action</th></tr></thead>
+            <thead><tr><th>Server</th><th>Peak CPU</th><th>Avg CPU</th><th>vCPUs</th><th>RAM (GB)</th><th>Status</th><th>Recommended action</th></tr></thead>
             <tbody>${rows}</tbody>
           </table>`;
         } catch (err) {
@@ -715,11 +741,61 @@
       }
       overviewRefresh.addEventListener("click", loadOverview);
 
+      // ---------- Datasets ----------
+      let currentDatasetId = "synthetic";
+      const datasetSelect = document.getElementById("dataset-select");
+      const datasetStatus = document.getElementById("dataset-status");
+      const datasetFileInput = document.getElementById("dataset-file");
+
+      async function loadDatasets(selectId) {
+        try {
+          const res = await fetch("/datasets");
+          const data = await res.json();
+          datasetSelect.innerHTML = data.datasets
+            .map(
+              (d) =>
+                `<option value="${d.dataset_id}">${d.label} - ${d.servers} servers, ${d.rows} rows (${d.date_range.start} to ${d.date_range.end})</option>`,
+            )
+            .join("");
+          if (selectId) datasetSelect.value = selectId;
+          currentDatasetId = datasetSelect.value || "synthetic";
+        } catch (err) {
+          datasetSelect.innerHTML = '<option value="synthetic">synthetic</option>';
+        }
+      }
+
+      datasetSelect.addEventListener("change", () => {
+        currentDatasetId = datasetSelect.value;
+        loadServers(currentDatasetId);
+      });
+
+      document.getElementById("dataset-upload-btn").addEventListener("click", async () => {
+        const file = datasetFileInput.files[0];
+        if (!file) {
+          datasetStatus.innerHTML = '<span style="color:#b91c1c;">Choose a file first.</span>';
+          return;
+        }
+        datasetStatus.textContent = "Uploading and validating...";
+        const formData = new FormData();
+        formData.append("file", file);
+        formData.append("dataset_label", file.name);
+        try {
+          const res = await fetch("/datasets/upload", { method: "POST", body: formData });
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.detail || "Upload failed");
+          datasetStatus.innerHTML = `<span style="color:#166534;">Loaded "${data.label}": ${data.servers} servers, ${data.rows} rows (${data.date_range.start} to ${data.date_range.end})${data.has_server_specs ? "" : " - no cpu_cores/installed_ram columns found, rightsizing will assume 8 vCPUs."}</span>`;
+          await loadDatasets(data.dataset_id);
+          await loadServers(currentDatasetId);
+        } catch (err) {
+          datasetStatus.innerHTML = `<span style="color:#b91c1c;">${err.message}</span>`;
+        }
+      });
+
       // ---------- Server list ----------
       const forecastServerSelect = document.getElementById("forecast-server");
-      async function loadServers() {
+      async function loadServers(datasetId = currentDatasetId) {
         try {
-          const res = await fetch("/servers");
+          const res = await fetch(`/servers?dataset_id=${encodeURIComponent(datasetId)}`);
           const data = await res.json();
           forecastServerSelect.innerHTML = data.servers
             .map(
@@ -813,7 +889,7 @@
           const res = await fetch("/forecast", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ server_id, model, horizon_days }),
+            body: JSON.stringify({ server_id, model, horizon_days, dataset_id: currentDatasetId }),
           });
           if (!res.ok) throw new Error((await res.json().catch(() => null))?.detail || res.statusText);
           const data = await res.json();
@@ -1147,6 +1223,7 @@
         const maxErr = Math.max(...hm.models.flatMap((m) => hm.mae_matrix[m]));
         const heatmapRows = hm.servers
           .map((server, i) => {
+            const info = hm.server_info?.[i] || {};
             const cells = hm.models
               .map((m) => {
                 const val = hm.mae_matrix[m][i];
@@ -1154,11 +1231,11 @@
                 return `<td style="background: rgba(239,68,68,${alpha});">${val}</td>`;
               })
               .join("");
-            return `<tr><td>${server}</td>${cells}</tr>`;
+            return `<tr><td>${server}</td><td>${info.cpu_cores ?? "-"}</td><td>${info.installed_ram_gb ?? "-"}</td>${cells}</tr>`;
           })
           .join("");
         document.getElementById("heatmap-container").innerHTML = `<table class="heatmap-table">
-          <thead><tr><th>Server</th>${hm.models.map((m) => `<th>${m}</th>`).join("")}</tr></thead>
+          <thead><tr><th>Server</th><th>vCPUs</th><th>RAM (GB)</th>${hm.models.map((m) => `<th>${m}</th>`).join("")}</tr></thead>
           <tbody>${heatmapRows}</tbody>
         </table>`;
       }
@@ -1190,7 +1267,7 @@
 
       // ---------- Init ----------
       loadOverview();
-      loadServers();
+      loadDatasets().then(() => loadServers(currentDatasetId));
       loadModelMetrics();
       loadModelComparison();
     </script>

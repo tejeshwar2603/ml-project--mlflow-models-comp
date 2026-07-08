@@ -148,6 +148,11 @@ def recursive_xgboost_forecast(hist: pd.DataFrame, horizon_days: int, predict_fn
     return results
 
 
+DEFAULT_DATASET_ID = "synthetic"
+REQUIRED_DATASET_COLUMNS = ["server_id", "timestamp", "cpu_utilization", "ram_utilization", "disk_utilization", "network_utilization"]
+DEFAULT_CPU_CORES = 8  # fallback when a dataset doesn't supply cpu_cores (e.g. uploaded data, or App-101)
+
+
 class ForecastService:
     def __init__(
         self,
@@ -161,12 +166,8 @@ class ForecastService:
     ) -> None:
         self._xgb_model = xgb_model
         self._xgb_load_error = xgb_load_error
-        self._raw = validate_data(generate_synthetic_data(n_servers=n_servers, n_days=n_days, seed=seed))
-        self._server_meta = (
-            self._raw.groupby("server_id")
-            .agg(cpu_cores=("cpu_cores", "first"), installed_ram=("installed_ram", "first"))
-            .to_dict(orient="index")
-        )
+        self._datasets: dict[str, dict[str, Any]] = {}
+        self._register_synthetic_dataset(n_servers, n_days, seed)
         self._store = PredictionStore(artifacts_dir)
         self._mae_by_model = self._load_mae_comparison(mlruns_comparison_path)
 
@@ -178,21 +179,86 @@ class ForecastService:
         except Exception:
             return {}
 
-    def _cores_for(self, server_id: str) -> int:
-        meta = self._server_meta.get(server_id)
-        return int(meta["cpu_cores"]) if meta else 8  # fallback for servers outside the synthetic set (e.g. App-101)
+    @staticmethod
+    def _build_server_meta(raw: pd.DataFrame) -> dict[str, dict[str, Any]]:
+        if "cpu_cores" not in raw.columns:
+            return {}
+        agg = {"cpu_cores": ("cpu_cores", "first")}
+        if "installed_ram" in raw.columns:
+            agg["installed_ram"] = ("installed_ram", "first")
+        return raw.groupby("server_id").agg(**agg).to_dict(orient="index")
 
-    def list_servers(self) -> list[dict[str, Any]]:
-        latest = self._raw.sort_values("timestamp").groupby("server_id").tail(1)
-        history_counts = self._raw.groupby("server_id").size()
+    def _register_synthetic_dataset(self, n_servers: int, n_days: int, seed: int) -> None:
+        raw = validate_data(generate_synthetic_data(n_servers=n_servers, n_days=n_days, seed=seed))
+        self._datasets[DEFAULT_DATASET_ID] = {
+            "raw": raw,
+            "server_meta": self._build_server_meta(raw),
+            "label": f"Synthetic demo data ({n_servers} servers x {n_days} days)",
+            "source": "built-in",
+        }
+
+    def register_uploaded_dataset(self, dataset_id: str, df: pd.DataFrame, label: str | None = None) -> dict[str, Any]:
+        missing = [c for c in REQUIRED_DATASET_COLUMNS if c not in df.columns]
+        if missing:
+            raise ValueError(
+                f"Missing required columns: {missing}. Expected: {REQUIRED_DATASET_COLUMNS} "
+                f"(+ optional cpu_cores, installed_ram). Found: {list(df.columns)}"
+            )
+        raw = validate_data(df)
+        if raw.empty:
+            raise ValueError("Uploaded dataset has no valid rows after validation.")
+        self._datasets[dataset_id] = {
+            "raw": raw,
+            "server_meta": self._build_server_meta(raw),
+            "label": label or dataset_id,
+            "source": "uploaded",
+        }
+        return self.dataset_summary(dataset_id)
+
+    def _dataset(self, dataset_id: str) -> dict[str, Any]:
+        if dataset_id not in self._datasets:
+            raise ValueError(f"Unknown dataset_id: {dataset_id}. Available: {list(self._datasets.keys())}")
+        return self._datasets[dataset_id]
+
+    def dataset_summary(self, dataset_id: str) -> dict[str, Any]:
+        d = self._dataset(dataset_id)
+        raw = d["raw"]
+        return {
+            "dataset_id": dataset_id,
+            "label": d["label"],
+            "source": d["source"],
+            "servers": int(raw["server_id"].nunique()),
+            "rows": int(len(raw)),
+            "date_range": {
+                "start": raw["timestamp"].min().strftime("%Y-%m-%d"),
+                "end": raw["timestamp"].max().strftime("%Y-%m-%d"),
+            },
+            "has_server_specs": bool(d["server_meta"]),
+        }
+
+    def list_datasets(self) -> list[dict[str, Any]]:
+        return [self.dataset_summary(ds_id) for ds_id in self._datasets]
+
+    def _cores_for(self, server_id: str, dataset_id: str = DEFAULT_DATASET_ID) -> int:
+        meta = self._dataset(dataset_id)["server_meta"].get(server_id)
+        return int(meta["cpu_cores"]) if meta and "cpu_cores" in meta else DEFAULT_CPU_CORES
+
+    def _ram_for(self, server_id: str, dataset_id: str = DEFAULT_DATASET_ID) -> int | None:
+        meta = self._dataset(dataset_id)["server_meta"].get(server_id)
+        return int(meta["installed_ram"]) if meta and "installed_ram" in meta else None
+
+    def list_servers(self, dataset_id: str = DEFAULT_DATASET_ID) -> list[dict[str, Any]]:
+        raw = self._dataset(dataset_id)["raw"]
+        latest = raw.sort_values("timestamp").groupby("server_id").tail(1)
+        history_counts = raw.groupby("server_id").size()
         out = []
         for _, row in latest.iterrows():
             server_id = row["server_id"]
             out.append(
                 {
                     "server_id": server_id,
-                    "cpu_cores": int(row["cpu_cores"]),
-                    "installed_ram_gb": int(row["installed_ram"]),
+                    "cpu_cores": self._cores_for(server_id, dataset_id),
+                    "installed_ram_gb": self._ram_for(server_id, dataset_id),
                     "current_cpu": round(float(row["cpu_utilization"]), 1),
                     "current_ram": round(float(row["ram_utilization"]), 1),
                     "history_days": int(history_counts.get(server_id, 0)),
@@ -209,8 +275,9 @@ class ForecastService:
             out.append(row)
         return sorted(out, key=lambda r: r.get("mae", float("inf")))
 
-    def _server_history(self, server_id: str) -> pd.DataFrame:
-        return self._raw[self._raw["server_id"] == server_id].sort_values("timestamp").reset_index(drop=True)
+    def _server_history(self, server_id: str, dataset_id: str = DEFAULT_DATASET_ID) -> pd.DataFrame:
+        raw = self._dataset(dataset_id)["raw"]
+        return raw[raw["server_id"] == server_id].sort_values("timestamp").reset_index(drop=True)
 
     def _select_model(self, n_points: int) -> tuple[str, str]:
         if n_points < 60:
@@ -282,12 +349,13 @@ class ForecastService:
             "estimated_monthly_cost_delta_usd": 0.0,
         }
 
-    def forecast(self, server_id: str, horizon_days: int = 7, model: str = "auto") -> dict[str, Any]:
+    def forecast(self, server_id: str, horizon_days: int = 7, model: str = "auto", dataset_id: str = DEFAULT_DATASET_ID) -> dict[str, Any]:
         if horizon_days < 1 or horizon_days > MAX_HORIZON_DAYS:
             raise ValueError(f"horizon_days must be between 1 and {MAX_HORIZON_DAYS}.")
-        hist = self._server_history(server_id)
+        self._dataset(dataset_id)  # raises a clear error if unknown
+        hist = self._server_history(server_id, dataset_id)
         if hist.empty:
-            raise ValueError(f"Unknown server_id: {server_id}")
+            raise ValueError(f"Unknown server_id: {server_id} in dataset '{dataset_id}'")
 
         model_reason = None
         if model == "auto":
@@ -296,6 +364,14 @@ class ForecastService:
             raise ValueError(f"Unsupported live model: {model}. Supported: auto, {', '.join(LIVE_MODELS)}.")
         else:
             model_reason = f"Manually selected {MODEL_INFO[model]['label']}."
+
+        if model == "xgboost" and dataset_id != DEFAULT_DATASET_ID:
+            model_reason = (
+                (model_reason + " " if model_reason else "")
+                + "Note: XGBoost uses the model pre-trained on the synthetic dataset's feature "
+                "distribution, not retrained on this uploaded data - treat its output with more "
+                "caution here than ARIMA/SARIMA, which refit directly on this dataset."
+            )
 
         if model == "xgboost":
             raw_points = self._forecast_xgboost(hist, horizon_days)
@@ -307,11 +383,12 @@ class ForecastService:
         points = [{"date": d.strftime("%Y-%m-%d"), "predicted_cpu": round(v, 2)} for d, v in raw_points]
         values = [p["predicted_cpu"] for p in points]
         peak, avg, low = max(values), sum(values) / len(values), min(values)
-        cpu_cores = self._cores_for(server_id)
+        cpu_cores = self._cores_for(server_id, dataset_id)
         recommendation = self._rightsizing(peak, avg, cpu_cores)
 
         return {
             "server_id": server_id,
+            "dataset_id": dataset_id,
             "model_used": model,
             "model_selection_reason": model_reason,
             "horizon_days": horizon_days,
@@ -346,6 +423,7 @@ class ForecastService:
                     "peak_predicted_cpu": round(float(row["max"]), 1),
                     "avg_predicted_cpu": round(float(row["mean"]), 1),
                     "cpu_cores": cpu_cores,
+                    "installed_ram_gb": self._ram_for(server_id),
                     **rec,
                 }
             )

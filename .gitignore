@@ -12,6 +12,7 @@ env/
 *.log
 *.err
 mlflow.db
+mlflow_tracking.db*
 
 # MLflow and generated artifact directories
 mlruns/

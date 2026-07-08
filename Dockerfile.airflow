@@ -1,0 +1,15 @@
+FROM apache/airflow:2.9.3-python3.11
+
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential && rm -rf /var/lib/apt/lists/*
+USER airflow
+
+COPY requirements.txt /tmp/requirements.txt
+
+# CPU-only torch wheel to avoid pulling multi-GB CUDA builds inside the container.
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu \
+ && pip install --no-cache-dir -r /tmp/requirements.txt \
+ && pip install --no-cache-dir kafka-python
+
+ENV PYTHONPATH=/opt/airflow/project
+WORKDIR /opt/airflow/project

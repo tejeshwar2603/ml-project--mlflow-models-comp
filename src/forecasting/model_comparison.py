@@ -467,7 +467,7 @@ def _dm_matrix(y_test: pd.Series, model_results: dict) -> dict:
     return out
 
 
-def _per_server_heatmap(test: pd.DataFrame, y_test: pd.Series, model_results: dict) -> dict:
+def _per_server_heatmap(test: pd.DataFrame, y_test: pd.Series, model_results: dict, raw: pd.DataFrame) -> dict:
     df = test[["server_id"]].copy().reset_index(drop=True)
     df["actual"] = np.asarray(y_test)
     servers = sorted(df["server_id"].unique())
@@ -477,7 +477,17 @@ def _per_server_heatmap(test: pd.DataFrame, y_test: pd.Series, model_results: di
         df["err"] = (df["pred"] - df["actual"]).abs()
         per_server = df.groupby("server_id")["err"].mean()
         matrix[name] = [round(float(per_server.get(s, np.nan)), 2) for s in servers]
-    return {"servers": servers, "models": ALL_MODELS, "mae_matrix": matrix}
+
+    specs = raw.groupby("server_id").agg(cpu_cores=("cpu_cores", "first"), installed_ram=("installed_ram", "first"))
+    server_info = [
+        {
+            "server_id": s,
+            "cpu_cores": int(specs.loc[s, "cpu_cores"]) if s in specs.index else None,
+            "installed_ram_gb": int(specs.loc[s, "installed_ram"]) if s in specs.index else None,
+        }
+        for s in servers
+    ]
+    return {"servers": servers, "server_info": server_info, "models": ALL_MODELS, "mae_matrix": matrix}
 
 
 # ---------------------------------------------------------------------------
@@ -643,7 +653,8 @@ def _save_plots(results: dict) -> list[Path]:
     ax.set_xticks(range(len(hm["models"])))
     ax.set_xticklabels(hm["models"])
     ax.set_yticks(range(len(hm["servers"])))
-    ax.set_yticklabels(hm["servers"], fontsize=7)
+    y_labels = [f"{info['server_id']} ({info['cpu_cores']} vCPU)" for info in hm["server_info"]]
+    ax.set_yticklabels(y_labels, fontsize=7)
     ax.set_title("Per-server MAE heatmap")
     fig.colorbar(im, ax=ax, label="MAE")
     fig.tight_layout()
@@ -690,7 +701,7 @@ def run_comparison() -> dict:
 
     print("Diebold-Mariano tests + per-server heatmap...")
     dm_tests = _dm_matrix(y_test, model_results)
-    per_server_heatmap = _per_server_heatmap(test, y_test, model_results)
+    per_server_heatmap = _per_server_heatmap(test, y_test, model_results, raw)
 
     mae_summary = {m: round(_safe_mae(np.asarray(y_test), model_results[m]["y_pred"]), 3) for m in ALL_MODELS}
 

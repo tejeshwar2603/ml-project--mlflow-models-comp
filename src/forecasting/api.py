@@ -1,9 +1,12 @@
 import os
 import logging
+from pathlib import Path
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import pandas as pd
-from .chatbot import AIOpsChatbot
+from .chatbot import AIOpsChatbot, _llm_configured
+from .rag import DEFAULT_VECTOR_STORE_PATH, build_vector_store_from_environment
 
 
 FEATURE_COLUMNS = [
@@ -84,9 +87,24 @@ class ChatResponse(BaseModel):
     ml_output: dict | None = None
 
 
+def _ensure_vector_store(path: str | Path) -> None:
+    store_path = Path(path)
+    if store_path.exists():
+        return
+    logger = logging.getLogger("src.forecasting.api")
+    logger.warning("Vector store missing at %s; building from local artifacts...", store_path)
+    build_vector_store_from_environment(store_path)
+
+
 def create_app(model_uri: str | None = None):
     app = FastAPI(title="CPU Forecasting API")
+    static_dir = Path(__file__).resolve().parent / "static"
     logger = logging.getLogger("src.forecasting.api")
+    vector_store_path = os.getenv("RAG_VECTOR_STORE_PATH", str(DEFAULT_VECTOR_STORE_PATH))
+    try:
+        _ensure_vector_store(vector_store_path)
+    except Exception as exc:
+        logger.warning("Could not build vector store automatically: %s", exc)
     uri = normalize_model_uri(model_uri or os.getenv("FORECAST_MODEL_URI", "models:/cpu_forecast/Production"))
     logger.info("Loading MLflow model from URI: %s", uri)
     print(f"Loading MLflow model from URI: {uri}")
@@ -108,7 +126,7 @@ def create_app(model_uri: str | None = None):
     chatbot = None
     chatbot_error = None
     try:
-        chatbot = AIOpsChatbot(os.getenv("RAG_VECTOR_STORE_PATH", "artifacts/vector_store.pkl"))
+        chatbot = AIOpsChatbot(vector_store_path)
     except Exception as exc:
         chatbot_error = str(exc)
 
@@ -126,11 +144,26 @@ def create_app(model_uri: str | None = None):
                 "executive_report": "POST /llm/executive-report",
                 "root_cause": "POST /llm/root-cause",
             },
+            "ui": "GET /ui",
         }
 
     @app.get("/health")
     def health():
-        return {"status": "ok", "model_uri": uri}
+        from .chatbot import DEFAULT_GROK_MODEL, _grok_api_key
+
+        grok_key = _grok_api_key()
+        llm_model = os.getenv("AIOPS_LLM_MODEL")
+        if not llm_model:
+            llm_model = DEFAULT_GROK_MODEL if grok_key else os.getenv("OPENAI_API_KEY") and "gpt-4.1-mini" or None
+        return {
+            "status": "ok",
+            "model_uri": uri,
+            "llm_configured": _llm_configured(),
+            "llm_provider": "grok" if grok_key else ("openai" if os.getenv("OPENAI_API_KEY") else None),
+            "llm_model": llm_model,
+            "vector_store_path": vector_store_path,
+            "vector_store_ready": Path(vector_store_path).exists(),
+        }
 
     @app.post("/predict", response_model=PredictResponse)
     def predict(request: PredictRequest):
@@ -184,6 +217,13 @@ def create_app(model_uri: str | None = None):
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         return ChatResponse(**result)
+
+    @app.get("/ui", response_class=FileResponse)
+    def ui():
+        ui_path = static_dir / "chatbot_ui.html"
+        if not ui_path.exists():
+            raise HTTPException(status_code=404, detail="Chatbot UI not found.")
+        return FileResponse(ui_path, media_type="text/html")
 
     @app.post("/llm/capacity-summary")
     def capacity_summary(request: ChatRequest):

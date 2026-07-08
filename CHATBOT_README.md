@@ -38,6 +38,7 @@ curl http://127.0.0.1:8001/health
 ```
 
 **Response:**
+
 ```json
 {
   "status": "ok",
@@ -54,6 +55,7 @@ curl http://127.0.0.1:8001/health
 Answers operational questions using ML predictions and retrieved knowledge base.
 
 **Request:**
+
 ```json
 {
   "question": "Which servers will exceed 90% CPU next week?",
@@ -68,6 +70,7 @@ Answers operational questions using ML predictions and retrieved knowledge base.
 ```
 
 **Response:**
+
 ```json
 {
   "answer": "App-101 is expected to exceed 90% CPU...",
@@ -91,7 +94,7 @@ Answers operational questions using ML predictions and retrieved knowledge base.
     {
       "source": "artifacts\\sarima\\predictions.csv",
       "score": 0.38,
-      "metadata": {"server_id": "App-101", "kind": "prediction"}
+      "metadata": { "server_id": "App-101", "kind": "prediction" }
     },
     "..."
   ]
@@ -107,6 +110,7 @@ Answers operational questions using ML predictions and retrieved knowledge base.
 Generates a capacity planning summary using the forecast and historical patterns.
 
 **Request:**
+
 ```json
 {
   "question": "Summarize capacity needs for the next 30 days.",
@@ -131,6 +135,7 @@ Generates a capacity planning summary using the forecast and historical patterns
 Drafts a Jira ticket with summary, description, and suggested labels.
 
 **Request:**
+
 ```json
 {
   "question": "Draft a ticket for this high CPU forecast.",
@@ -144,6 +149,7 @@ Drafts a Jira ticket with summary, description, and suggested labels.
 ```
 
 **Response:**
+
 ```json
 {
   "ticket_draft": {
@@ -166,6 +172,7 @@ Drafts a Jira ticket with summary, description, and suggested labels.
 Generates a business-friendly executive summary.
 
 **Request:**
+
 ```json
 {
   "question": "Summarize capacity risks for leadership.",
@@ -189,6 +196,7 @@ Generates a business-friendly executive summary.
 Identifies likely root causes by comparing forecast patterns with historical incidents.
 
 **Request:**
+
 ```json
 {
   "question": "What is causing the CPU spike on App-101?",
@@ -270,6 +278,7 @@ curl -X POST http://127.0.0.1:8001/llm/executive-report \
 ## Building the RAG Vector Store
 
 The vector store indexes:
+
 - **Local files**: `README.md`, `ARCHITECTURE.md` (configurable via `RAG_LOCAL_PATHS`)
 - **Prediction CSVs**: all `artifacts/**/predictions.csv` files
 - **Confluence** (optional): Atlassian wikis (if `CONFLUENCE_SPACE_KEY` and credentials set)
@@ -316,13 +325,16 @@ The LLM does not replace the forecasting model; it sits on top to explain predic
 ## Troubleshooting
 
 **"LLM provider is not configured"**
+
 - Ensure `llma-key` is set in `.env` or environment.
 - Verify `LLAMA_API_URL` points to a working endpoint (defaults to Grok).
 
 **"Chatbot vector store could not be loaded"**
+
 - Run `python -m src.forecasting.build_vector_store` to build or rebuild the vector store.
 
 **Port already in use**
+
 - Set `API_PORT` to a different port (default 8001).
 
 ---
@@ -330,6 +342,7 @@ The LLM does not replace the forecasting model; it sits on top to explain predic
 ## Integration Scenarios
 
 ### Scenario 1: Capacity Planning Meeting
+
 ```bash
 # Get a summary for leadership
 curl -X POST http://127.0.0.1:8001/llm/executive-report \
@@ -337,6 +350,7 @@ curl -X POST http://127.0.0.1:8001/llm/executive-report \
 ```
 
 ### Scenario 2: Automated Jira Ticket
+
 ```bash
 # Draft a ticket from forecast
 curl -X POST http://127.0.0.1:8001/llm/draft-ticket \
@@ -344,6 +358,7 @@ curl -X POST http://127.0.0.1:8001/llm/draft-ticket \
 ```
 
 ### Scenario 3: Root Cause Investigation
+
 ```bash
 # Identify likely causes
 curl -X POST http://127.0.0.1:8001/llm/root-cause \

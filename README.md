@@ -52,6 +52,14 @@ python -m src.forecasting.build_vector_store
 
 Then start the API and call `POST /chat`. If `OPENAI_API_KEY` is set, the chatbot uses the OpenAI-compatible model configured by `AIOPS_LLM_MODEL`; otherwise it returns a retrieved-context answer with sources.
 
+The same app also exposes a built-in web UI for interactive questioning. Start the server and open:
+
+```text
+http://127.0.0.1:8001/ui
+```
+
+From that page you can ask about model output comparison, CPU utilization forecasting, capacity planning, and more.
+
 Example chat request:
 
 ```json

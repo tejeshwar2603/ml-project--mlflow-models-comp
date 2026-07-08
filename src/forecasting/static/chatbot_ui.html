@@ -1,0 +1,316 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AIOps Chatbot UI</title>
+    <style>
+      body {
+        font-family:
+          Inter,
+          system-ui,
+          -apple-system,
+          BlinkMacSystemFont,
+          "Segoe UI",
+          sans-serif;
+        margin: 0;
+        padding: 24px;
+        background: #f4f6fb;
+        color: #1f2937;
+      }
+      .page {
+        max-width: 960px;
+        margin: 0 auto;
+      }
+      h1 {
+        margin-bottom: 8px;
+      }
+      .panel {
+        background: white;
+        border-radius: 16px;
+        padding: 24px;
+        box-shadow: 0 8px 24px rgba(15, 23, 42, 0.08);
+        margin-bottom: 24px;
+      }
+      label {
+        display: block;
+        margin-bottom: 14px;
+        font-weight: 600;
+      }
+      textarea,
+      input,
+      select {
+        width: 100%;
+        border: 1px solid #d1d5db;
+        border-radius: 12px;
+        padding: 12px;
+        font-size: 14px;
+        margin-top: 6px;
+      }
+      textarea {
+        min-height: 120px;
+        resize: vertical;
+      }
+      .smaller {
+        font-size: 13px;
+        color: #4b5563;
+        margin-top: 6px;
+      }
+      .row {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 18px;
+      }
+      .row-3 {
+        display: grid;
+        grid-template-columns: 1fr 1fr 1fr;
+        gap: 18px;
+      }
+      button {
+        padding: 14px 22px;
+        border: none;
+        border-radius: 12px;
+        background: #4f46e5;
+        color: white;
+        font-weight: 700;
+        cursor: pointer;
+        transition: background 0.2s ease;
+      }
+      button:hover {
+        background: #4338ca;
+      }
+      .result-block {
+        background: #ffffff;
+        border-radius: 16px;
+        padding: 20px;
+        margin-bottom: 16px;
+        border: 1px solid #e5e7eb;
+      }
+      .result-block h2 {
+        margin-top: 0;
+        font-size: 18px;
+      }
+      .badge {
+        display: inline-flex;
+        align-items: center;
+        background: #eef2ff;
+        color: #4338ca;
+        padding: 6px 10px;
+        border-radius: 999px;
+        font-size: 13px;
+        margin-right: 8px;
+      }
+      pre {
+        background: #f8fafc;
+        padding: 16px;
+        border-radius: 12px;
+        overflow-x: auto;
+        color: #111827;
+      }
+      .hidden {
+        display: none;
+      }
+      .footer {
+        font-size: 13px;
+        color: #6b7280;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="page">
+      <div class="panel">
+        <h1>AIOps Chatbot</h1>
+        <p class="smaller">
+          Ask questions about ML model outputs, capacity planning, CPU
+          utilization, forecast comparisons, and operational recommendations.
+          The answer appears below on the same page.
+        </p>
+        <form id="chat-form">
+          <label>
+            Question
+            <textarea
+              id="question"
+              placeholder="Try: Compare the CPU forecast model output with recent utilization trends..."
+              required
+            ></textarea>
+          </label>
+          <div class="row">
+            <label>
+              Analysis mode
+              <select id="analysis_mode">
+                <option value="general">General</option>
+                <option value="capacity_planning">Capacity planning</option>
+                <option value="jira_ticket">Draft Jira ticket</option>
+                <option value="executive_report">Executive report</option>
+                <option value="root_cause">Root cause</option>
+              </select>
+            </label>
+            <label>
+              Top K sources
+              <input id="top_k" type="number" min="1" max="20" value="5" />
+            </label>
+            <label>
+              <input id="include_prediction" type="checkbox" /> Include ML
+              prediction
+              <div class="smaller">
+                Send a model prediction request to the chatbot for richer CPU
+                forecast and utilization answers.
+              </div>
+            </label>
+          </div>
+          <div id="prediction-fields" class="panel hidden">
+            <h2>Prediction request</h2>
+            <div class="row">
+              <label>
+                Server ID
+                <input id="server_id" placeholder="server-123" />
+              </label>
+              <label>
+                Horizon
+                <input id="horizon" type="number" value="1" min="1" />
+              </label>
+            </div>
+            <label>
+              Feature values (JSON)
+              <textarea
+                id="features"
+                placeholder='{"cpu_utilization": 72, "ram_utilization": 63, "disk_utilization": 41, "network_utilization": 18, "day_of_week": 3, "month": 7, "is_weekend": false}'
+              ></textarea>
+              <div class="smaller">
+                Provide forecast input features if you want the chatbot to
+                include actual CPU utilization predictions.
+              </div>
+            </label>
+          </div>
+          <label>
+            Optional ML output JSON
+            <textarea
+              id="ml_output"
+              placeholder='{"cpu_utilization": 70, "forecast_trend": "increasing"}'
+            ></textarea>
+            <div class="smaller">
+              Paste an existing model output or comparison data for the chatbot
+              to reason over directly.
+            </div>
+          </label>
+          <button type="submit">Send question</button>
+        </form>
+      </div>
+
+      <div id="result-container"></div>
+      <div class="footer">
+        Built on the same AIOps chatbot API used by the backend. Use the form
+        above to ask utilization, forecasting, and model comparison questions.
+      </div>
+    </div>
+
+    <script>
+      const includePrediction = document.getElementById("include_prediction");
+      const predictionFields = document.getElementById("prediction-fields");
+      const resultContainer = document.getElementById("result-container");
+      const form = document.getElementById("chat-form");
+
+      includePrediction.addEventListener("change", () => {
+        predictionFields.classList.toggle("hidden", !includePrediction.checked);
+      });
+
+      function renderResult(data) {
+        const sections = [];
+        sections.push(
+          `<div class="result-block"><h2>Answer</h2><p>${data.answer || "No answer returned."}</p></div>`,
+        );
+        if (data.recommendation)
+          sections.push(
+            `<div class="result-block"><h2>Recommendation</h2><p>${data.recommendation}</p></div>`,
+          );
+        if (data.executive_summary)
+          sections.push(
+            `<div class="result-block"><h2>Executive summary</h2><p>${data.executive_summary}</p></div>`,
+          );
+        if (data.action_plan?.length)
+          sections.push(
+            `<div class="result-block"><h2>Action plan</h2><ul>${data.action_plan.map((item) => `<li>${item}</li>`).join("")}</ul></div>`,
+          );
+        if (data.risk)
+          sections.push(
+            `<div class="result-block"><h2>Risk</h2><pre>${JSON.stringify(data.risk, null, 2)}</pre></div>`,
+          );
+        if (data.sources?.length)
+          sections.push(
+            `<div class="result-block"><h2>Sources</h2><pre>${JSON.stringify(data.sources, null, 2)}</pre></div>`,
+          );
+        if (
+          data.jira_ticket_draft &&
+          Object.keys(data.jira_ticket_draft).length
+        )
+          sections.push(
+            `<div class="result-block"><h2>Jira draft</h2><pre>${JSON.stringify(data.jira_ticket_draft, null, 2)}</pre></div>`,
+          );
+        if (data.ml_output)
+          sections.push(
+            `<div class="result-block"><h2>ML output</h2><pre>${JSON.stringify(data.ml_output, null, 2)}</pre></div>`,
+          );
+        resultContainer.innerHTML = sections.join("");
+      }
+
+      form.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        resultContainer.innerHTML =
+          '<div class="result-block"><p>Sending request...</p></div>';
+
+        const question = document.getElementById("question").value.trim();
+        const analysis_mode = document.getElementById("analysis_mode").value;
+        const top_k = Number(document.getElementById("top_k").value) || 5;
+        const include_prediction = includePrediction.checked;
+        const server_id = document.getElementById("server_id").value.trim();
+        const horizon = Number(document.getElementById("horizon").value) || 1;
+        const featuresText = document.getElementById("features").value.trim();
+        const mlOutputText = document.getElementById("ml_output").value.trim();
+
+        const payload = {
+          question,
+          analysis_mode,
+          top_k,
+          include_prediction,
+        };
+
+        if (mlOutputText) {
+          try {
+            payload.ml_output = JSON.parse(mlOutputText);
+          } catch (error) {
+            resultContainer.innerHTML = `<div class="result-block"><p style="color:#b91c1c;">Invalid ML output JSON: ${error.message}</p></div>`;
+            return;
+          }
+        }
+        if (include_prediction) {
+          try {
+            payload.prediction_request = {
+              server_id: server_id || "server-1",
+              horizon,
+              features: featuresText ? JSON.parse(featuresText) : {},
+            };
+          } catch (error) {
+            resultContainer.innerHTML = `<div class="result-block"><p style="color:#b91c1c;">Invalid features JSON: ${error.message}</p></div>`;
+            return;
+          }
+        }
+
+        try {
+          const response = await fetch("/chat", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+          if (!response.ok) {
+            const error = await response.json().catch(() => null);
+            throw new Error(error?.detail || response.statusText);
+          }
+          const data = await response.json();
+          renderResult(data);
+        } catch (err) {
+          resultContainer.innerHTML = `<div class="result-block"><p style="color:#b91c1c;">Request failed: ${err.message}</p></div>`;
+        }
+      });
+    </script>
+  </body>
+</html>

@@ -5,6 +5,7 @@
 A complete LLM+RAG system has been implemented to augment ML forecasting models with intelligent operational recommendations, automated ticket drafting, and knowledge base integration.
 
 **Architecture:**
+
 ```
 ML Forecasting Model (Predictions)
         ↓
@@ -18,6 +19,7 @@ Capacity Planning | Ticket Drafts | Executive Reports | Root Cause Analysis
 ## What Was Implemented
 
 ### 1. Vector Store & RAG Ingestion ✓
+
 - **File**: `src/forecasting/rag.py`
 - Ingests:
   - Local markdown/text files (`README.md`, `ARCHITECTURE.md`)
@@ -28,6 +30,7 @@ Capacity Planning | Ticket Drafts | Executive Reports | Root Cause Analysis
 - Stores in pickle format: `artifacts/vector_store.pkl`
 
 ### 2. Grok/Llama LLM Adapter ✓
+
 - **File**: `src/forecasting/chatbot.py` → `_llama_http_answer()`
 - Prioritizes `llma-key` from `.env` over OpenAI
 - Sends chat completion requests to `https://api.x.ai/v1/chat/completions` (Grok)
@@ -35,6 +38,7 @@ Capacity Planning | Ticket Drafts | Executive Reports | Root Cause Analysis
 - Allows custom endpoint via `LLAMA_API_URL` env var
 
 ### 3. Chatbot with 7 Analysis Modes ✓
+
 - **File**: `src/forecasting/chatbot.py` → `AIOpsChatbot.answer()`
 - Modes:
   - `general` — Direct Q&A
@@ -46,6 +50,7 @@ Capacity Planning | Ticket Drafts | Executive Reports | Root Cause Analysis
   - `change_impact` — Deployment risk assessment
 
 ### 4. FastAPI Endpoints ✓
+
 - **File**: `src/forecasting/api.py`
 - Endpoints:
   - `POST /health` — Server status
@@ -57,12 +62,14 @@ Capacity Planning | Ticket Drafts | Executive Reports | Root Cause Analysis
   - `POST /llm/root-cause` — Root cause analysis
 
 ### 5. Fine-Tune Data Generation ✓
+
 - **File**: `src/forecasting/generate_finetune_data.py`
 - Converts prediction CSVs to OpenAI fine-tune JSONL format
 - Output: `artifacts/finetune_predictions.jsonl` (2400+ examples)
 - Includes prompt/completion pairs for LLM training
 
 ### 6. Helper Scripts ✓
+
 - **`src/forecasting/build_vector_store.py`** — Build/rebuild RAG index
 - **`src/forecasting/inspect_retrievals.py`** — Debug RAG search results
 - **`src/forecasting/test_rag_query.py`** — Test chatbot end-to-end
@@ -70,6 +77,7 @@ Capacity Planning | Ticket Drafts | Executive Reports | Root Cause Analysis
 - **`examples_chatbot_usage.py`** — Example API calls for all endpoints
 
 ### 7. Documentation ✓
+
 - **`CHATBOT_README.md`** — Full API reference with cURL examples
 - **`.env` configuration** — LLM credentials and settings
 - Inline code documentation and type hints
@@ -79,6 +87,7 @@ Capacity Planning | Ticket Drafts | Executive Reports | Root Cause Analysis
 ## Files Created/Modified
 
 ### Created:
+
 - `src/forecasting/generate_finetune_data.py` — Fine-tune JSONL generator
 - `src/forecasting/inspect_retrievals.py` — RAG debugging tool
 - `src/forecasting/test_rag_query.py` — End-to-end chatbot test
@@ -87,6 +96,7 @@ Capacity Planning | Ticket Drafts | Executive Reports | Root Cause Analysis
 - `CHATBOT_README.md` — Full API documentation
 
 ### Modified:
+
 - `src/forecasting/rag.py` — Added `load_prediction_files()` + prediction ingestion
 - `src/forecasting/__init__.py` — Lightweight imports (avoid mlflow at package import)
 - `src/forecasting/chatbot.py` — Added `_llama_http_answer()` + Grok/Llama support
@@ -97,27 +107,35 @@ Capacity Planning | Ticket Drafts | Executive Reports | Root Cause Analysis
 ## How to Run
 
 ### Start the Chatbot Server
+
 ```bash
 python start_chatbot.py
 ```
+
 Server runs on `http://127.0.0.1:8001`
 
 ### Build/Rebuild Vector Store
+
 ```bash
 python -m src.forecasting.build_vector_store
 ```
+
 Ingests predictions + local docs → `artifacts/vector_store.pkl`
 
 ### Generate Fine-Tune Data
+
 ```bash
 python -m src.forecasting.generate_finetune_data
 ```
+
 Outputs → `artifacts/finetune_predictions.jsonl`
 
 ### Run Examples
+
 ```bash
 python examples_chatbot_usage.py
 ```
+
 Tests all endpoints (capacity, tickets, reports, root-cause)
 
 ---
@@ -145,6 +163,7 @@ API_PORT=8001
 ## API Examples
 
 ### Capacity Planning
+
 ```bash
 curl -X POST http://127.0.0.1:8001/llm/capacity-summary \
   -H "Content-Type: application/json" \
@@ -155,6 +174,7 @@ curl -X POST http://127.0.0.1:8001/llm/capacity-summary \
 ```
 
 ### Draft Jira Ticket
+
 ```bash
 curl -X POST http://127.0.0.1:8001/llm/draft-ticket \
   -H "Content-Type: application/json" \
@@ -164,6 +184,7 @@ curl -X POST http://127.0.0.1:8001/llm/draft-ticket \
 ```
 
 ### Executive Report
+
 ```bash
 curl -X POST http://127.0.0.1:8001/llm/executive-report \
   -H "Content-Type: application/json" \
@@ -174,6 +195,7 @@ curl -X POST http://127.0.0.1:8001/llm/executive-report \
 ```
 
 ### Root Cause Analysis
+
 ```bash
 curl -X POST http://127.0.0.1:8001/llm/root-cause \
   -H "Content-Type: application/json" \
@@ -188,6 +210,7 @@ curl -X POST http://127.0.0.1:8001/llm/root-cause \
 ## Response Format
 
 All endpoints return:
+
 ```json
 {
   "answer": "LLM-generated response...",
@@ -213,7 +236,7 @@ All endpoints return:
     {
       "source": "artifacts\\sarima\\predictions.csv",
       "score": 0.38,
-      "metadata": {"server_id": "App-101", "kind": "prediction"}
+      "metadata": { "server_id": "App-101", "kind": "prediction" }
     }
   ],
   "ml_output": {
@@ -269,13 +292,16 @@ All endpoints return:
 ## Troubleshooting
 
 **"LLM provider is not configured"**
+
 - Ensure `llma-key` is set in `.env`
 - Verify `LLAMA_API_URL` points to a valid endpoint
 
 **"Chatbot vector store could not be loaded"**
+
 - Run: `python -m src.forecasting.build_vector_store`
 
 **"Connection refused" on port 8001**
+
 - Ensure server is running: `python start_chatbot.py`
 - Check port not in use: `netstat -ano | findstr :8001`
 
@@ -284,6 +310,7 @@ All endpoints return:
 ## Summary
 
 A production-ready LLM+RAG system is now in place to:
+
 - **Explain** ML forecasts in operational terms
 - **Recommend** scaling, incident prevention, and mitigation
 - **Automate** Jira ticket creation and knowledge retrieval
@@ -295,11 +322,13 @@ The LLM sits on top of the forecasting model—it doesn't replace it. Instead, i
 ---
 
 **Start the chatbot:**
+
 ```bash
 python start_chatbot.py
 ```
 
 **Test it:**
+
 ```bash
 python examples_chatbot_usage.py
 ```

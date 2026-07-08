@@ -148,7 +148,15 @@ def load_prediction_files(paths: list[str]) -> list[Document]:
             for _, row in df.iterrows():
                 server = str(row.get("server_id") or row.get("server") or row.get("host") or "unknown")
                 date = str(row.get("date") or row.get("timestamp") or "")
-                prediction = row.get("prediction") if "prediction" in row else row.get("predicted") if "predicted" in row else None
+                prediction = (
+                    row.get("prediction")
+                    if "prediction" in row
+                    else row.get("predicted_cpu_utilization")
+                    if "predicted_cpu_utilization" in row
+                    else row.get("predicted")
+                    if "predicted" in row
+                    else None
+                )
                 current = row.get("current_cpu") if "current_cpu" in row else row.get("current") if "current" in row else None
                 horizon = row.get("horizon") if "horizon" in row else None
                 text_parts = [f"Server: {server}"]

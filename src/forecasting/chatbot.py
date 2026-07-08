@@ -2,6 +2,7 @@ import json
 import os
 from typing import Any
 
+from .predictions import PredictionStore, format_prediction_answer
 from .rag import DEFAULT_VECTOR_STORE_PATH, VectorStore
 
 
@@ -30,6 +31,35 @@ def _format_context(results: list[dict[str, Any]]) -> str:
             f"[{idx}] source={item['source']} score={item['score']:.3f}\n{item['text']}"
         )
     return "\n\n".join(parts)
+
+
+def _format_insights(insights: dict[str, Any] | None) -> str:
+    if not insights:
+        return "none"
+    if insights.get("type") == "capacity_scan":
+        threshold = insights.get("threshold")
+        horizon = insights.get("horizon_days")
+        matches = insights.get("matches") or []
+        top_servers = insights.get("top_servers") or []
+        date_range = insights.get("date_range") or {}
+        lines = [
+            f"Capacity scan across all indexed servers (threshold={threshold}%, horizon={horizon} day(s), "
+            f"forecast window {date_range.get('start', '?')} to {date_range.get('end', '?')}):",
+        ]
+        if matches:
+            lines.append(f"Servers at/above {threshold}%:")
+            for item in matches:
+                lines.append(
+                    f"- {item['server_id']}: peak {item['peak_prediction']}% on {item['peak_date']} (model={item['model']})"
+                )
+        else:
+            lines.append(f"No servers are at/above {threshold}%.")
+        if top_servers:
+            lines.append("Highest predicted peaks across ALL indexed servers (for full ranking, not just threshold hits):")
+            for item in top_servers:
+                lines.append(f"- {item['server_id']}: {item['peak_prediction']}%")
+        return "\n".join(lines)
+    return json.dumps(insights, indent=2, default=str)
 
 
 def _forecast_risk(ml_output: dict[str, Any] | None) -> dict[str, Any]:
@@ -108,20 +138,61 @@ def _build_operational_output(
     }
 
 
+DEFAULT_GROK_MODEL = "grok-4.3"
+DEFAULT_OPENAI_MODEL = "gpt-4.1-mini"
+
+
+def _grok_api_key() -> str | None:
+    return (
+        os.getenv("llma-key")
+        or os.getenv("LLMA_KEY")
+        or os.getenv("GROK_API_KEY")
+        or os.getenv("XAI_API_KEY")
+    )
+
+
+def _llm_configured() -> bool:
+    return bool(_grok_api_key() or os.getenv("OPENAI_API_KEY"))
+
+
+def _fallback_prefix(llm_error: str | None = None) -> str:
+    if llm_error:
+        return f"LLM call failed ({llm_error}), so this answer uses indexed ML/RAG context instead.\n\n"
+    if not _llm_configured():
+        return "LLM provider is not configured, so this answer uses indexed ML/RAG context instead.\n\n"
+    return ""
+
+
 def _fallback_answer(
     question: str,
     retrieved: list[dict[str, Any]],
     ml_output: dict[str, Any] | None,
     analysis_mode: str,
+    insights: dict[str, Any] | None = None,
+    llm_error: str | None = None,
 ) -> str:
+    prediction_answer = format_prediction_answer(question, ml_output, insights, analysis_mode)
+    if prediction_answer:
+        prefix = _fallback_prefix(llm_error)
+        if prefix:
+            prediction_answer = prefix + prediction_answer
+        if retrieved:
+            sources = ", ".join(item["source"] for item in retrieved[:3])
+            prediction_answer += f"\n\nSupporting RAG sources: {sources}"
+        return prediction_answer
+
     context = _format_context(retrieved)
     forecast = json.dumps(ml_output or {}, indent=2)
-    if not retrieved and not ml_output:
+    if not retrieved and not ml_output and not insights:
+        if llm_error:
+            return f"LLM call failed ({llm_error}) and there is not enough indexed context or ML output to answer this yet."
+        if not _llm_configured():
+            return "I do not have enough indexed context or ML output to answer this yet."
         return "I do not have enough indexed context or ML output to answer this yet."
     mode_instruction = ANALYSIS_MODES.get(analysis_mode, ANALYSIS_MODES["general"])
     return (
-        "LLM provider is not configured, so this is a retrieved-context answer.\n\n"
-        f"Analysis mode: {analysis_mode} - {mode_instruction}\n\n"
+        _fallback_prefix(llm_error)
+        + f"Analysis mode: {analysis_mode} - {mode_instruction}\n\n"
         f"Question: {question}\n\n"
         f"ML forecast context:\n{forecast}\n\n"
         f"Top retrieved evidence:\n{context}"
@@ -134,15 +205,15 @@ def _llama_http_answer(
     ml_output: dict[str, Any] | None,
     analysis_mode: str,
     llama_key: str,
-) -> str | None:
+    insights: dict[str, Any] | None = None,
+) -> tuple[str | None, str | None]:
     """Call a Grok/Llama-compatible HTTP chat API using the provided key."""
     import urllib.request
     import urllib.error
-    
-    # Default to Grok's API endpoint (xAI), but allow override
+
     llama_url = os.getenv("LLAMA_API_URL", "https://api.x.ai/v1/chat/completions")
-    model = os.getenv("AIOPS_LLM_MODEL", "grok-beta")
-    
+    model = os.getenv("AIOPS_LLM_MODEL", DEFAULT_GROK_MODEL)
+
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {
@@ -151,53 +222,56 @@ def _llama_http_answer(
                 f"Analysis mode: {analysis_mode}\n"
                 f"Mode instruction: {ANALYSIS_MODES.get(analysis_mode, ANALYSIS_MODES['general'])}\n\n"
                 f"Question:\n{question}\n\n"
-                f"ML forecast output:\n{json.dumps(ml_output or {}, indent=2)}\n\n"
+                f"ML forecast output (single top match, if any):\n{json.dumps(ml_output or {}, indent=2)}\n\n"
+                f"Fleet-wide ML insights (use this for questions about multiple/all servers):\n{_format_insights(insights)}\n\n"
                 f"Retrieved context:\n{_format_context(retrieved)}"
             ),
         },
     ]
     
-    payload = {"model": model, "messages": messages, "temperature": 0.1}
+    payload: dict[str, Any] = {"model": model, "messages": messages, "temperature": 0.1}
+    if model.startswith("grok-"):
+        payload["reasoning_effort"] = os.getenv("AIOPS_LLM_REASONING_EFFORT", "none")
     data = json.dumps(payload).encode("utf-8")
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {llama_key}",
+        "User-Agent": "Mozilla/5.0 (compatible; AIOpsChatbot/1.0)",
     }
     
     try:
         req = urllib.request.Request(llama_url, data=data, headers=headers, method="POST")
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=60) as resp:
             body = json.loads(resp.read().decode("utf-8"))
         
-        # Try OpenAI-like response: choices[0].message.content
         choices = body.get("choices") or []
         if choices:
             first = choices[0]
             if isinstance(first.get("message"), dict):
                 content = first["message"].get("content")
                 if content:
-                    return content
-            # Some providers return text directly
+                    return content, None
             if first.get("text"):
-                return first.get("text")
+                return first.get("text"), None
         
-        # As a last resort, try top-level 'text' or 'response'
         if isinstance(body.get("text"), str):
-            return body.get("text")
+            return body.get("text"), None
         if isinstance(body.get("response"), str):
-            return body.get("response")
+            return body.get("response"), None
+        return None, "Unexpected LLM response format"
     except urllib.error.HTTPError as e:
         try:
             err_body = e.read().decode("utf-8")
             print(f"LLM HTTP error {e.code}: {err_body}")
+            return None, f"HTTP {e.code}: {err_body}"
         except Exception:
             print(f"LLM HTTP error: {e}")
-        return None
+            return None, f"HTTP {e.code}"
     except Exception as e:
         print(f"LLM call failed: {e}")
-        return None
+        return None, str(e)
     
-    return None
+    return None, "Empty LLM response"
 
 
 def _openai_answer(
@@ -205,23 +279,21 @@ def _openai_answer(
     retrieved: list[dict[str, Any]],
     ml_output: dict[str, Any] | None,
     analysis_mode: str,
-) -> str | None:
-    # Prioritize Grok/Llama key over OpenAI
-    llama_key = os.getenv("llma-key") or os.getenv("LLMA_KEY")
+    insights: dict[str, Any] | None = None,
+) -> tuple[str | None, str | None]:
+    llama_key = _grok_api_key()
     if llama_key:
-        # Use generic HTTP adapter for Grok/Llama
-        return _llama_http_answer(question, retrieved, ml_output, analysis_mode, llama_key)
-    
-    # Fallback to OpenAI if available
+        return _llama_http_answer(question, retrieved, ml_output, analysis_mode, llama_key, insights=insights)
+
     openai_key = os.getenv("OPENAI_API_KEY")
     if not openai_key:
-        return None
+        return None, None
     try:
         from openai import OpenAI
-    except Exception:
-        return None
+    except Exception as exc:
+        return None, str(exc)
 
-    model = os.getenv("AIOPS_LLM_MODEL", "gpt-4.1-mini")
+    model = os.getenv("AIOPS_LLM_MODEL", DEFAULT_OPENAI_MODEL)
     client = OpenAI(api_key=openai_key)
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -231,19 +303,28 @@ def _openai_answer(
                 f"Analysis mode: {analysis_mode}\n"
                 f"Mode instruction: {ANALYSIS_MODES.get(analysis_mode, ANALYSIS_MODES['general'])}\n\n"
                 f"Question:\n{question}\n\n"
-                f"ML forecast output:\n{json.dumps(ml_output or {}, indent=2)}\n\n"
+                f"ML forecast output (single top match, if any):\n{json.dumps(ml_output or {}, indent=2)}\n\n"
+                f"Fleet-wide ML insights (use this for questions about multiple/all servers):\n{_format_insights(insights)}\n\n"
                 f"Retrieved context:\n{_format_context(retrieved)}"
             ),
         },
     ]
-    response = client.chat.completions.create(model=model, messages=messages, temperature=0.1)
-    return response.choices[0].message.content or ""
+    try:
+        response = client.chat.completions.create(model=model, messages=messages, temperature=0.1)
+        return response.choices[0].message.content or "", None
+    except Exception as exc:
+        return None, str(exc)
 
 
 class AIOpsChatbot:
-    def __init__(self, vector_store_path: str = str(DEFAULT_VECTOR_STORE_PATH)) -> None:
+    def __init__(
+        self,
+        vector_store_path: str = str(DEFAULT_VECTOR_STORE_PATH),
+        artifacts_dir: str | None = None,
+    ) -> None:
         self.vector_store_path = vector_store_path
         self.vector_store = VectorStore.load(vector_store_path)
+        self.prediction_store = PredictionStore(artifacts_dir or "artifacts")
 
     def answer(
         self,
@@ -254,14 +335,35 @@ class AIOpsChatbot:
     ) -> dict[str, Any]:
         if analysis_mode not in ANALYSIS_MODES:
             raise ValueError(f"Unsupported analysis_mode: {analysis_mode}")
+        resolved = self.prediction_store.resolve_context(question, ml_output)
+        ml_output = resolved.get("ml_output")
+        insights = resolved.get("insights")
+        if ml_output is None and insights and insights.get("matches"):
+            top_match = insights["matches"][0]
+            ml_output = {
+                "server_id": top_match["server_id"],
+                "prediction": top_match["peak_prediction"],
+                "horizon": insights.get("horizon_days", 7),
+                "peak_date": top_match.get("peak_date"),
+                "model": top_match.get("model"),
+            }
         retrieved = self.vector_store.search(question, top_k=top_k)
         structured = _build_operational_output(question, retrieved, ml_output, analysis_mode)
-        answer = _openai_answer(question, retrieved, ml_output, analysis_mode)
+        answer, llm_error = _openai_answer(question, retrieved, ml_output, analysis_mode, insights=insights)
         if answer is None:
-            answer = _fallback_answer(question, retrieved, ml_output, analysis_mode)
+            answer = _fallback_answer(
+                question,
+                retrieved,
+                ml_output,
+                analysis_mode,
+                insights,
+                llm_error=llm_error,
+            )
         return {
             "answer": answer,
             **structured,
+            "llm_configured": _llm_configured(),
+            "llm_error": llm_error,
             "sources": [
                 {
                     "source": item["source"],
@@ -271,4 +373,5 @@ class AIOpsChatbot:
                 for item in retrieved
             ],
             "ml_output": ml_output,
+            "insights": insights,
         }

@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import logging
 from pathlib import Path
 from fastapi import FastAPI, HTTPException
@@ -182,6 +183,7 @@ def create_app(model_uri: str | None = None):
                 "model_metrics": "GET /models/metrics",
                 "forecast": "POST /forecast",
                 "capacity_overview": "GET /capacity-overview",
+                "model_comparison": "GET /model-comparison",
             },
             "ui": "GET /ui",
         }
@@ -251,6 +253,20 @@ def create_app(model_uri: str | None = None):
     @app.get("/capacity-overview")
     def capacity_overview(horizon_days: int = 7):
         return {"servers": forecast_service.fleet_overview(horizon_days=horizon_days)}
+
+    @app.get("/model-comparison")
+    def model_comparison():
+        results_path = Path("artifacts/model_comparison/results.json")
+        if not results_path.exists():
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    "Model comparison analysis has not been run yet. Run "
+                    "'python -m src.forecasting.model_comparison' to generate it "
+                    "(takes a few minutes; also logs plots to MLflow)."
+                ),
+            )
+        return json.loads(results_path.read_text())
 
     @app.post("/chat", response_model=ChatResponse)
     def chat(request: ChatRequest):

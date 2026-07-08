@@ -105,6 +105,49 @@ MODEL_INFO = {
 }
 
 
+def recursive_xgboost_forecast(hist: pd.DataFrame, horizon_days: int, predict_fn) -> list[tuple[pd.Timestamp, float]]:
+    """Recursive multi-step XGBoost forecast, shared by ForecastService and the offline
+    model-comparison analysis so both use the exact same forecasting logic.
+
+    predict_fn: callable(DataFrame[FEATURE_COLUMNS]) -> array-like of predictions
+    (works with both an mlflow.pyfunc model and a raw xgboost.XGBRegressor).
+    """
+    working = hist[["server_id", "timestamp", "cpu_utilization", "ram_utilization", "disk_utilization", "network_utilization"]].copy()
+    ram_persist = float(working["ram_utilization"].tail(7).mean())
+    disk_persist = float(working["disk_utilization"].tail(7).mean())
+    net_persist = float(working["network_utilization"].tail(7).mean())
+    last_date = working["timestamp"].max()
+
+    results: list[tuple[pd.Timestamp, float]] = []
+    for step in range(1, horizon_days + 1):
+        next_date = last_date + timedelta(days=step)
+        placeholder_cpu = float(working["cpu_utilization"].iloc[-1])  # proxy for this-day ratio features only
+        new_row = pd.DataFrame(
+            [
+                {
+                    "server_id": working["server_id"].iloc[0],
+                    "timestamp": next_date,
+                    "cpu_utilization": placeholder_cpu,
+                    "ram_utilization": ram_persist,
+                    "disk_utilization": disk_persist,
+                    "network_utilization": net_persist,
+                }
+            ]
+        )
+        working = pd.concat([working, new_row], ignore_index=True)
+        feats = build_features(working)
+        row = feats[feats["timestamp"] == next_date]
+        if row.empty:
+            raise ValueError("Not enough history to compute lag/rolling features for the requested horizon.")
+        X = row[FEATURE_COLUMNS]
+        pred = predict_fn(X)
+        pred = float(pred.tolist()[0]) if hasattr(pred, "tolist") else float(pred)
+        pred = float(np.clip(pred, 0, 100))
+        working.loc[working["timestamp"] == next_date, "cpu_utilization"] = pred
+        results.append((next_date, pred))
+    return results
+
+
 class ForecastService:
     def __init__(
         self,
@@ -201,41 +244,7 @@ class ForecastService:
             raise ValueError(f"XGBoost model is not loaded: {self._xgb_load_error or 'unknown error'}")
         if len(hist) < MIN_HISTORY_FOR_XGBOOST:
             raise ValueError(f"Need at least {MIN_HISTORY_FOR_XGBOOST} historical days for XGBoost; only {len(hist)} available.")
-
-        working = hist[["server_id", "timestamp", "cpu_utilization", "ram_utilization", "disk_utilization", "network_utilization"]].copy()
-        ram_persist = float(working["ram_utilization"].tail(7).mean())
-        disk_persist = float(working["disk_utilization"].tail(7).mean())
-        net_persist = float(working["network_utilization"].tail(7).mean())
-        last_date = working["timestamp"].max()
-
-        results: list[tuple[pd.Timestamp, float]] = []
-        for step in range(1, horizon_days + 1):
-            next_date = last_date + timedelta(days=step)
-            placeholder_cpu = float(working["cpu_utilization"].iloc[-1])  # proxy for this-day ratio features only
-            new_row = pd.DataFrame(
-                [
-                    {
-                        "server_id": working["server_id"].iloc[0],
-                        "timestamp": next_date,
-                        "cpu_utilization": placeholder_cpu,
-                        "ram_utilization": ram_persist,
-                        "disk_utilization": disk_persist,
-                        "network_utilization": net_persist,
-                    }
-                ]
-            )
-            working = pd.concat([working, new_row], ignore_index=True)
-            feats = build_features(working)
-            row = feats[feats["timestamp"] == next_date]
-            if row.empty:
-                raise ValueError("Not enough history to compute lag/rolling features for the requested horizon.")
-            X = row[FEATURE_COLUMNS]
-            pred = self._xgb_model.predict(X)
-            pred = float(pred.tolist()[0]) if hasattr(pred, "tolist") else float(pred)
-            pred = float(np.clip(pred, 0, 100))
-            working.loc[working["timestamp"] == next_date, "cpu_utilization"] = pred
-            results.append((next_date, pred))
-        return results
+        return recursive_xgboost_forecast(hist, horizon_days, self._xgb_model.predict)
 
     def _rightsizing(self, peak: float, avg: float, cpu_cores: int) -> dict[str, Any]:
         if peak >= UNDERSIZED_PEAK_THRESHOLD:

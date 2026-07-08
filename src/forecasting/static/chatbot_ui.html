@@ -401,7 +401,9 @@
             .csv) to forecast and rightsize against your own servers instead.
             Required columns: <code>server_id, timestamp, cpu_utilization,
             ram_utilization, disk_utilization, network_utilization</code>
-            (optional: <code>cpu_cores, installed_ram</code>).
+            (optional: <code>cpu_cores, installed_ram</code>). Uploading
+            automatically trains all 4 models on it and logs the run to
+            MLflow (and triggers the Airflow DAG if it's running).
           </p>
           <div class="row">
             <label>
@@ -414,6 +416,7 @@
             </label>
           </div>
           <button type="button" id="dataset-upload-btn">Upload &amp; use this dataset</button>
+          <button type="button" class="secondary" id="dataset-retrain-btn">Retrain models on active dataset</button>
           <div id="dataset-status" class="smaller"></div>
         </div>
 
@@ -769,13 +772,35 @@
         loadServers(currentDatasetId);
       });
 
-      document.getElementById("dataset-upload-btn").addEventListener("click", async () => {
+      function renderTrainingStatus(training) {
+        if (!training) return "";
+        const parts = [];
+        if (training.mlflow) {
+          const rows = training.mlflow.results
+            .map((r) => `<li>${r.model}: MAE ${r.mae.toFixed(2)}${training.mlflow.best_model === r.model ? " (best)" : ""}</li>`)
+            .join("");
+          parts.push(`<div style="color:#166534;">MLflow: trained ${training.mlflow.results.length} model(s) on this dataset - <a href="http://localhost:5000" target="_blank">view in MLflow</a><ul>${rows}</ul></div>`);
+          if (Object.keys(training.mlflow.errors || {}).length) {
+            parts.push(`<div class="smaller">Some models couldn't train on this dataset: ${JSON.stringify(training.mlflow.errors)}</div>`);
+          }
+        } else if (training.mlflow_error) {
+          parts.push(`<div style="color:#b91c1c;">MLflow training failed: ${training.mlflow_error}</div>`);
+        }
+        if (training.airflow_triggered) {
+          parts.push(`<div style="color:#166534;">Airflow DAG triggered - <a href="http://localhost:8090" target="_blank">view in Airflow</a></div>`);
+        } else if (training.airflow_error) {
+          parts.push(`<div class="smaller">Airflow trigger skipped: ${training.airflow_error}</div>`);
+        }
+        return parts.join("");
+      }
+
+      async function uploadDataset() {
         const file = datasetFileInput.files[0];
         if (!file) {
           datasetStatus.innerHTML = '<span style="color:#b91c1c;">Choose a file first.</span>';
           return;
         }
-        datasetStatus.textContent = "Uploading and validating...";
+        datasetStatus.textContent = "Uploading, validating, and training models on this dataset (a few seconds)...";
         const formData = new FormData();
         formData.append("file", file);
         formData.append("dataset_label", file.name);
@@ -783,13 +808,29 @@
           const res = await fetch("/datasets/upload", { method: "POST", body: formData });
           const data = await res.json();
           if (!res.ok) throw new Error(data.detail || "Upload failed");
-          datasetStatus.innerHTML = `<span style="color:#166534;">Loaded "${data.label}": ${data.servers} servers, ${data.rows} rows (${data.date_range.start} to ${data.date_range.end})${data.has_server_specs ? "" : " - no cpu_cores/installed_ram columns found, rightsizing will assume 8 vCPUs."}</span>`;
+          datasetStatus.innerHTML = `<div style="color:#166534;">Loaded "${data.label}": ${data.servers} servers, ${data.rows} rows (${data.date_range.start} to ${data.date_range.end})${data.has_server_specs ? "" : " - no cpu_cores/installed_ram columns found, rightsizing will assume 8 vCPUs."}</div>${renderTrainingStatus(data.training)}`;
           await loadDatasets(data.dataset_id);
           await loadServers(currentDatasetId);
         } catch (err) {
           datasetStatus.innerHTML = `<span style="color:#b91c1c;">${err.message}</span>`;
         }
-      });
+      }
+
+      async function retrainCurrentDataset() {
+        if (!currentDatasetId) return;
+        datasetStatus.textContent = `Retraining models on "${currentDatasetId}"...`;
+        try {
+          const res = await fetch(`/datasets/${encodeURIComponent(currentDatasetId)}/train`, { method: "POST" });
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.detail || "Retrain failed");
+          datasetStatus.innerHTML = renderTrainingStatus(data);
+        } catch (err) {
+          datasetStatus.innerHTML = `<span style="color:#b91c1c;">${err.message}</span>`;
+        }
+      }
+
+      document.getElementById("dataset-upload-btn").addEventListener("click", uploadDataset);
+      document.getElementById("dataset-retrain-btn").addEventListener("click", retrainCurrentDataset);
 
       // ---------- Server list ----------
       const forecastServerSelect = document.getElementById("forecast-server");

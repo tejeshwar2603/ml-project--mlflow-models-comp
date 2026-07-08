@@ -62,6 +62,7 @@ FEATURE_COLUMNS = [
 LIVE_MODELS = ("xgboost", "arima", "sarima")
 MAX_HORIZON_DAYS = 90
 MIN_HISTORY_FOR_XGBOOST = 30  # matches the max lag window in features.py
+UPLOADED_DATASETS_DIR = Path("artifacts/uploaded_datasets")
 
 # Rightsizing thresholds (illustrative demo defaults).
 UNDERSIZED_PEAK_THRESHOLD = 85.0
@@ -207,11 +208,18 @@ class ForecastService:
         raw = validate_data(df)
         if raw.empty:
             raise ValueError("Uploaded dataset has no valid rows after validation.")
+        # Persist to disk so it's readable outside this process (training.py CLI, the
+        # Airflow DAG in its own container) - in-memory registration alone can't be
+        # trained against by anything other than this ForecastService instance.
+        UPLOADED_DATASETS_DIR.mkdir(parents=True, exist_ok=True)
+        dataset_path = UPLOADED_DATASETS_DIR / f"{dataset_id}.csv"
+        raw.to_csv(dataset_path, index=False)
         self._datasets[dataset_id] = {
             "raw": raw,
             "server_meta": self._build_server_meta(raw),
             "label": label or dataset_id,
             "source": "uploaded",
+            "path": str(dataset_path),
         }
         return self.dataset_summary(dataset_id)
 
@@ -234,10 +242,14 @@ class ForecastService:
                 "end": raw["timestamp"].max().strftime("%Y-%m-%d"),
             },
             "has_server_specs": bool(d["server_meta"]),
+            "trainable": d["source"] == "uploaded",  # built-in synthetic already has a trained/registered model
         }
 
     def list_datasets(self) -> list[dict[str, Any]]:
         return [self.dataset_summary(ds_id) for ds_id in self._datasets]
+
+    def get_dataset_path(self, dataset_id: str) -> str | None:
+        return self._dataset(dataset_id).get("path")
 
     def _cores_for(self, server_id: str, dataset_id: str = DEFAULT_DATASET_ID) -> int:
         meta = self._dataset(dataset_id)["server_meta"].get(server_id)

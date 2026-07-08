@@ -21,6 +21,7 @@ artifacts/vector_store*.pkl
 artifacts/*.db
 artifacts/*.log
 artifacts/*.err
+artifacts/uploaded_datasets/
 
 # OS files
 Thumbs.db

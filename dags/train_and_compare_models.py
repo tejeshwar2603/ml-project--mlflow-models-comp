@@ -18,26 +18,45 @@ from airflow import DAG
 from airflow.operators.python import PythonOperator
 
 
-def _train(model_name: str, **_):
+def _dataset_conf(dag_run) -> tuple[str | None, str | None]:
+    """A manual trigger from the app (POST /datasets/{id}/train) passes
+    {"dataset_id": ..., "dataset_path": ...} as the run's conf; the daily
+    scheduled run has no conf and falls back to the built-in synthetic data."""
+    conf = getattr(dag_run, "conf", None) or {}
+    return conf.get("dataset_id"), conf.get("dataset_path")
+
+
+def _train(model_name: str, **context):
     from src.forecasting.training import train_one_model
 
-    result = train_one_model(model_name)
-    print(f"{model_name}: MAE={result['mae']:.3f} run_id={result['run_id']}")
+    dataset_id, dataset_path = _dataset_conf(context.get("dag_run"))
+    result = train_one_model(model_name, dataset_path=dataset_path, dataset_id=dataset_id)
+    print(f"{model_name} (dataset={dataset_id or 'synthetic'}): MAE={result['mae']:.3f} run_id={result['run_id']}")
     return result
 
 
-def _promote_best_model(**_):
+def _promote_best_model(**context):
     from src.forecasting.training import promote_best_xgboost_version
 
+    dataset_id, _ = _dataset_conf(context.get("dag_run"))
+    if dataset_id:
+        print(f"Skipping champion promotion: this run trained on ad-hoc dataset '{dataset_id}', "
+              "not the synthetic baseline that live forecasting serves by default.")
+        return
     version = promote_best_xgboost_version()
     if version is None:
         raise RuntimeError("Could not determine a best XGBoost version to promote.")
     print(f"Promoted cpu_forecast version {version} to alias 'champion'.")
 
 
-def _run_model_comparison(**_):
+def _run_model_comparison(**context):
     from src.forecasting.model_comparison import run_comparison
 
+    dataset_id, _ = _dataset_conf(context.get("dag_run"))
+    if dataset_id:
+        print(f"Skipping the full model-comparison analysis for ad-hoc dataset '{dataset_id}' "
+              "(it's scoped to the synthetic baseline dataset).")
+        return
     results = run_comparison()
     print(f"Model comparison finished in {results['generated_in_seconds']}s. MAE summary: {results['mae_summary']}")
 

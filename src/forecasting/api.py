@@ -134,7 +134,13 @@ def create_app(model_uri: str | None = None):
             # MLflow 3.x removed model-registry "stages" (Production/Staging/etc) in
             # favor of aliases, so legacy "models:/<name>/<stage>" URIs like the
             # default above now fail to resolve on any version. Fall back to the
-            # latest registered version so the API still starts with a usable model.
+            # "champion" alias set by training.promote_best_xgboost_version() if one
+            # exists, and only then to the newest registered version. Preferring the
+            # alias matters once ad-hoc dataset uploads start registering their own
+            # versions (see /datasets/{id}/train) - those are deliberately NOT
+            # promoted to champion, so "just take the highest version number" would
+            # otherwise let a tiny test upload silently become the model serving
+            # everyone else's forecasts on the next restart.
             match = re.match(r"^models:/([^/]+)/(Production|Staging|Archived|None)$", uri)
             if match:
                 registered_name = match.group(1)
@@ -142,20 +148,29 @@ def create_app(model_uri: str | None = None):
                     from mlflow import MlflowClient
 
                     client = MlflowClient()
-                    versions = client.search_model_versions(f"name='{registered_name}'")
-                    if versions:
-                        latest = max(versions, key=lambda v: int(v.version))
-                        fallback_uri = f"models:/{registered_name}/{latest.version}"
+                    fallback_uri = None
+                    try:
+                        registered = client.get_registered_model(registered_name)
+                        if "champion" in (registered.aliases or {}):
+                            fallback_uri = f"models:/{registered_name}@champion"
+                    except Exception:
+                        pass
+                    if fallback_uri is None:
+                        versions = client.search_model_versions(f"name='{registered_name}'")
+                        if versions:
+                            latest = max(versions, key=lambda v: int(v.version))
+                            fallback_uri = f"models:/{registered_name}/{latest.version}"
+                    if fallback_uri:
                         model = _mlflow_pyfunc.load_model(fallback_uri)
                         load_error = None
                         uri = fallback_uri
                         logger.warning(
-                            "Stage-based URI %s not resolvable under this MLflow version; loaded latest version instead: %s",
+                            "Stage-based URI %s not resolvable under this MLflow version; loaded %s instead.",
                             match.group(0),
                             fallback_uri,
                         )
                 except Exception as fallback_exc:
-                    load_error = f"{load_error}; fallback to latest version also failed: {fallback_exc}"
+                    load_error = f"{load_error}; alias/latest-version fallback also failed: {fallback_exc}"
     except Exception:
         # mlflow not installed or import failed; continue with model=None
         model = None
@@ -188,7 +203,8 @@ def create_app(model_uri: str | None = None):
                 "capacity_overview": "GET /capacity-overview",
                 "model_comparison": "GET /model-comparison",
                 "datasets": "GET /datasets",
-                "upload_dataset": "POST /datasets/upload (multipart file: .xlsx/.xls/.csv)",
+                "upload_dataset": "POST /datasets/upload (multipart file: .xlsx/.xls/.csv) - now also trains + logs to MLflow automatically",
+                "train_dataset": "POST /datasets/{dataset_id}/train - retrigger training/MLflow/Airflow for an already-uploaded dataset",
             },
             "ui": "GET /ui",
         }
@@ -279,9 +295,64 @@ def create_app(model_uri: str | None = None):
         resolved_id = dataset_id or f"upload-{uuid.uuid4().hex[:8]}"
         label = dataset_label or file.filename or resolved_id
         try:
-            return forecast_service.register_uploaded_dataset(resolved_id, df, label=label)
+            summary = forecast_service.register_uploaded_dataset(resolved_id, df, label=label)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
+
+        # Uploading a dataset used to just make it available for live forecasting and
+        # nothing else - no MLflow run, no Airflow trigger. That silent gap is exactly
+        # what /datasets/{id}/train below closes; call it automatically here so
+        # "I added a dataset" actually results in a visible MLflow run without a
+        # second manual step.
+        summary["training"] = _train_dataset_and_notify_airflow(resolved_id)
+        return summary
+
+    def _train_dataset_and_notify_airflow(target_dataset_id: str) -> dict:
+        from . import training as training_module
+
+        dataset_path = forecast_service.get_dataset_path(target_dataset_id)
+        result = {"mlflow": None, "mlflow_error": None, "airflow_triggered": False, "airflow_error": None}
+        if dataset_path:
+            try:
+                result["mlflow"] = training_module.train_on_dataset(target_dataset_id, dataset_path)
+            except Exception as exc:
+                result["mlflow_error"] = str(exc)
+        else:
+            result["mlflow_error"] = (
+                f"'{target_dataset_id}' has no persisted file to train from (only uploaded/streamed "
+                "datasets do). The built-in 'synthetic' dataset is trained via "
+                "'python -m src.forecasting.training' instead."
+            )
+
+        airflow_url = os.getenv("AIRFLOW_API_URL", "http://localhost:8090")
+        try:
+            import requests
+
+            resp = requests.post(
+                f"{airflow_url}/api/v1/dags/train_and_compare_models/dagRuns",
+                json={"conf": {"dataset_id": target_dataset_id, "dataset_path": dataset_path}},
+                auth=(os.getenv("AIRFLOW_USER", "admin"), os.getenv("AIRFLOW_PASSWORD", "admin")),
+                timeout=3,
+            )
+            if resp.status_code in (200, 201):
+                result["airflow_triggered"] = True
+            else:
+                result["airflow_error"] = f"HTTP {resp.status_code}: {resp.text[:200]}"
+        except Exception as exc:
+            result["airflow_error"] = f"Airflow not reachable at {airflow_url}: {exc}"
+        return result
+
+    @app.post("/datasets/{target_dataset_id}/train")
+    def train_dataset(target_dataset_id: str):
+        """Manually (re)trigger training for an already-uploaded dataset - the same
+        thing /datasets/upload now does automatically, exposed separately so a
+        dataset can be retrained later (e.g. after Kafka has streamed in more rows)
+        without re-uploading."""
+        try:
+            forecast_service.dataset_summary(target_dataset_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        return _train_dataset_and_notify_airflow(target_dataset_id)
 
     @app.post("/forecast")
     def forecast(request: ForecastRequest):

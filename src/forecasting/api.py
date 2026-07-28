@@ -4,6 +4,7 @@ import io
 import json
 import uuid
 import logging
+import threading
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.responses import FileResponse
@@ -13,12 +14,40 @@ from .chatbot import AIOpsChatbot, _llm_configured
 from .forecast_service import ForecastService
 from .rag import DEFAULT_VECTOR_STORE_PATH, build_vector_store_from_environment
 
+# Tracks background model-comparison analysis runs kicked off via
+# POST /datasets/{id}/model-comparison, keyed by dataset_id. This is the
+# in-process fallback for when Airflow (which the same analysis also runs
+# automatically after every dataset upload/train - see dags/train_and_compare_models.py)
+# isn't up or reachable; a single uvicorn worker process is assumed.
+_comparison_jobs_lock = threading.Lock()
+_comparison_jobs: dict[str, dict] = {}
 
+
+def _run_comparison_job(dataset_id: str) -> None:
+    from . import model_comparison
+
+    try:
+        model_comparison.run_comparison(dataset_id=dataset_id)
+        with _comparison_jobs_lock:
+            _comparison_jobs[dataset_id] = {"status": "done", "error": None}
+    except Exception as exc:
+        with _comparison_jobs_lock:
+            _comparison_jobs[dataset_id] = {"status": "error", "error": str(exc)}
+
+
+def _start_comparison_job(dataset_id: str) -> bool:
+    """Returns False if a job for this dataset_id is already running."""
+    with _comparison_jobs_lock:
+        current = _comparison_jobs.get(dataset_id)
+        if current and current["status"] == "running":
+            return False
+        _comparison_jobs[dataset_id] = {"status": "running", "error": None}
+    threading.Thread(target=_run_comparison_job, args=(dataset_id,), daemon=True).start()
+    return True
+
+
+# Must match forecast_service.FEATURE_COLUMNS / training.FEATURE_COLUMNS exactly.
 FEATURE_COLUMNS = [
-    "cpu_utilization",
-    "ram_utilization",
-    "disk_utilization",
-    "network_utilization",
     "cpu_utilization_lag_1",
     "cpu_utilization_lag_3",
     "cpu_utilization_lag_7",
@@ -32,8 +61,6 @@ FEATURE_COLUMNS = [
     "cpu_utilization_roll_std_7",
     "cpu_utilization_roll_min_7",
     "cpu_utilization_roll_max_7",
-    "cpu_ram_ratio",
-    "cpu_disk_ratio",
     "day_of_week",
     "month",
     "is_weekend",
@@ -201,7 +228,8 @@ def create_app(model_uri: str | None = None):
                 "model_metrics": "GET /models/metrics",
                 "forecast": "POST /forecast",
                 "capacity_overview": "GET /capacity-overview",
-                "model_comparison": "GET /model-comparison",
+                "model_comparison": "GET /model-comparison?dataset_id=synthetic",
+                "trigger_model_comparison": "POST /datasets/{dataset_id}/model-comparison - run the full comparison analysis for a dataset in the background (also runs automatically via Airflow after upload/train)",
                 "datasets": "GET /datasets",
                 "upload_dataset": "POST /datasets/upload (multipart file: .xlsx/.xls/.csv) - now also trains + logs to MLflow automatically",
                 "train_dataset": "POST /datasets/{dataset_id}/train - retrigger training/MLflow/Airflow for an already-uploaded dataset",
@@ -258,6 +286,13 @@ def create_app(model_uri: str | None = None):
     def list_servers(dataset_id: str = "synthetic"):
         try:
             return {"servers": forecast_service.list_servers(dataset_id=dataset_id)}
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+
+    @app.get("/servers/{server_id}/history")
+    def server_history(server_id: str, dataset_id: str = "synthetic", days: int = 30):
+        try:
+            return forecast_service.historical_utilization(server_id, dataset_id=dataset_id, days=days)
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc))
 
@@ -367,22 +402,47 @@ def create_app(model_uri: str | None = None):
             raise HTTPException(status_code=400, detail=str(exc))
 
     @app.get("/capacity-overview")
-    def capacity_overview(horizon_days: int = 7):
-        return {"servers": forecast_service.fleet_overview(horizon_days=horizon_days)}
+    def capacity_overview(horizon_days: int = 7, dataset_id: str = "synthetic"):
+        return {"servers": forecast_service.fleet_overview(horizon_days=horizon_days, dataset_id=dataset_id)}
 
     @app.get("/model-comparison")
-    def model_comparison():
-        results_path = Path("artifacts/model_comparison/results.json")
-        if not results_path.exists():
-            raise HTTPException(
-                status_code=404,
-                detail=(
-                    "Model comparison analysis has not been run yet. Run "
-                    "'python -m src.forecasting.model_comparison' to generate it "
-                    "(takes a few minutes; also logs plots to MLflow)."
-                ),
-            )
-        return json.loads(results_path.read_text())
+    def model_comparison(dataset_id: str = "synthetic"):
+        suffix = "" if dataset_id == "synthetic" else f"_{dataset_id}"
+        results_path = Path(f"artifacts/model_comparison/results{suffix}.json")
+        if results_path.exists():
+            # parse_constant guards against stale/edge-case results files containing
+            # NaN/Infinity (e.g. a dataset with missing readings that hit a study
+            # that doesn't fully guard against it) - Starlette's JSON response can't
+            # serialize those back out, so turn them into null here instead of 500ing.
+            return json.loads(results_path.read_text(), parse_constant=lambda _: None)
+
+        with _comparison_jobs_lock:
+            job = dict(_comparison_jobs.get(dataset_id) or {})
+        if job.get("status") == "running":
+            return {"status": "running", "dataset_id": dataset_id}
+        if job.get("status") == "error":
+            return {"status": "error", "dataset_id": dataset_id, "message": job.get("error")}
+
+        cli_arg = "" if dataset_id == "synthetic" else f" {dataset_id}"
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"Model comparison analysis has not been run yet for dataset '{dataset_id}'. "
+                f"POST /datasets/{dataset_id}/model-comparison to generate it in the background "
+                f"(takes a few minutes; also logs plots to MLflow), or run "
+                f"'python -m src.forecasting.model_comparison{cli_arg}' from the CLI."
+            ),
+        )
+
+    @app.post("/datasets/{target_dataset_id}/model-comparison")
+    def trigger_model_comparison(target_dataset_id: str):
+        if target_dataset_id != "synthetic":
+            try:
+                forecast_service.dataset_summary(target_dataset_id)
+            except ValueError as exc:
+                raise HTTPException(status_code=404, detail=str(exc))
+        started = _start_comparison_job(target_dataset_id)
+        return {"status": "started" if started else "already_running", "dataset_id": target_dataset_id}
 
     @app.post("/chat", response_model=ChatResponse)
     def chat(request: ChatRequest):

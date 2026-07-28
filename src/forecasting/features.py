@@ -22,12 +22,6 @@ def _calendar_features(df):
     return df
 
 
-def _ratio_features(df):
-    df["cpu_ram_ratio"] = df["cpu_utilization"] / df["ram_utilization"].replace(0, 1)
-    df["cpu_disk_ratio"] = df["cpu_utilization"] / df["disk_utilization"].replace(0, 1)
-    return df
-
-
 def build_features(df: pd.DataFrame):
     df = df.copy()
     df = validate_and_fill(df)
@@ -36,7 +30,12 @@ def build_features(df: pd.DataFrame):
     roll_windows = [3, 7, 14, 30]
     df = df.groupby("server_id", group_keys=False).apply(lambda g: _lag_features(g, "cpu_utilization", lag_cols))
     df = df.groupby("server_id", group_keys=False).apply(lambda g: _rolling_features(g, "cpu_utilization", roll_windows))
-    df = _ratio_features(df)
+    # Deliberately NOT included as ML features below (see training._prepare_ml_data /
+    # forecast_service.FEATURE_COLUMNS): the raw same-timestep cpu_utilization column,
+    # and any ratio derived from it, are only available here because this is historical
+    # data - a real forecast can't know the current, not-yet-observed value it's trying
+    # to predict. Selecting them as features would let a model trivially learn to copy
+    # its own label back out, which is exactly what was happening before this fix.
     df = df.dropna(subset=[f"cpu_utilization_lag_{lag}" for lag in lag_cols])
     return df.reset_index(drop=True)
 

@@ -32,13 +32,12 @@ from .data import generate_synthetic_data, validate_data
 from .features import build_features
 from .predictions import PredictionStore
 
-# Must match api.FEATURE_COLUMNS / training._prepare_ml_data exactly -
-# this is the exact column set + order the registered XGBoost model expects.
+# Must match api.FEATURE_COLUMNS / training.FEATURE_COLUMNS exactly - this is
+# the exact column set + order the registered XGBoost model expects. No raw
+# same-timestep cpu/ram/disk/network values or ratios derived from them - a
+# live forecast can't know the current, not-yet-observed reading it's trying
+# to predict, so those were target leakage (see training._prepare_ml_data).
 FEATURE_COLUMNS = [
-    "cpu_utilization",
-    "ram_utilization",
-    "disk_utilization",
-    "network_utilization",
     "cpu_utilization_lag_1",
     "cpu_utilization_lag_3",
     "cpu_utilization_lag_7",
@@ -52,8 +51,6 @@ FEATURE_COLUMNS = [
     "cpu_utilization_roll_std_7",
     "cpu_utilization_roll_min_7",
     "cpu_utilization_roll_max_7",
-    "cpu_ram_ratio",
-    "cpu_disk_ratio",
     "day_of_week",
     "month",
     "is_weekend",
@@ -76,10 +73,10 @@ MODEL_INFO = {
     "xgboost": {
         "label": "XGBoost",
         "description": (
-            "Gradient-boosted trees over engineered lag/rolling/ratio features. "
-            "Captures non-linear, multivariate patterns (CPU+RAM+Disk+Network)."
+            "Gradient-boosted trees over lagged/rolling CPU features and calendar "
+            "signals. Captures non-linear patterns in the CPU series itself."
         ),
-        "suited_for": "Medium-to-large history (90+ days), many servers, multivariate signals.",
+        "suited_for": "Medium-to-large history (90+ days), many servers, non-linear CPU patterns.",
         "live": True,
     },
     "arima": {
@@ -113,25 +110,29 @@ def recursive_xgboost_forecast(hist: pd.DataFrame, horizon_days: int, predict_fn
     predict_fn: callable(DataFrame[FEATURE_COLUMNS]) -> array-like of predictions
     (works with both an mlflow.pyfunc model and a raw xgboost.XGBRegressor).
     """
+    # ram/disk/network columns are carried along only because build_features()'s
+    # validate_and_fill() step expects them on the raw frame - they're not model
+    # inputs (see FEATURE_COLUMNS), so the exact carried-forward value doesn't
+    # affect the prediction; last-observed is enough.
     working = hist[["server_id", "timestamp", "cpu_utilization", "ram_utilization", "disk_utilization", "network_utilization"]].copy()
-    ram_persist = float(working["ram_utilization"].tail(7).mean())
-    disk_persist = float(working["disk_utilization"].tail(7).mean())
-    net_persist = float(working["network_utilization"].tail(7).mean())
+    ram_last = float(working["ram_utilization"].iloc[-1])
+    disk_last = float(working["disk_utilization"].iloc[-1])
+    net_last = float(working["network_utilization"].iloc[-1])
     last_date = working["timestamp"].max()
 
     results: list[tuple[pd.Timestamp, float]] = []
     for step in range(1, horizon_days + 1):
         next_date = last_date + timedelta(days=step)
-        placeholder_cpu = float(working["cpu_utilization"].iloc[-1])  # proxy for this-day ratio features only
+        placeholder_cpu = float(working["cpu_utilization"].iloc[-1])  # overwritten with the real prediction below
         new_row = pd.DataFrame(
             [
                 {
                     "server_id": working["server_id"].iloc[0],
                     "timestamp": next_date,
                     "cpu_utilization": placeholder_cpu,
-                    "ram_utilization": ram_persist,
-                    "disk_utilization": disk_persist,
-                    "network_utilization": net_persist,
+                    "ram_utilization": ram_last,
+                    "disk_utilization": disk_last,
+                    "network_utilization": net_last,
                 }
             ]
         )
@@ -219,7 +220,10 @@ class ForecastService:
             "server_meta": self._build_server_meta(raw),
             "label": label or dataset_id,
             "source": "uploaded",
-            "path": str(dataset_path),
+            # as_posix() (forward slashes) not str() - this path is also read inside the
+            # Linux Airflow container via a shared volume mount, where backslashes aren't
+            # path separators. Windows accepts forward slashes fine, so this is safe both sides.
+            "path": dataset_path.as_posix(),
         }
         return self.dataset_summary(dataset_id)
 
@@ -290,6 +294,37 @@ class ForecastService:
     def _server_history(self, server_id: str, dataset_id: str = DEFAULT_DATASET_ID) -> pd.DataFrame:
         raw = self._dataset(dataset_id)["raw"]
         return raw[raw["server_id"] == server_id].sort_values("timestamp").reset_index(drop=True)
+
+    def historical_utilization(
+        self, server_id: str, dataset_id: str = DEFAULT_DATASET_ID, days: int | None = 30
+    ) -> dict[str, Any]:
+        """Actual observed cpu_utilization for this server - not a forecast/prediction.
+        Bucketed to daily min/max/avg (like a CloudWatch-style min/max/avg chart) since
+        the underlying data is often sub-daily; every value here comes straight from the
+        uploaded/synthetic dataset, nothing modeled or smoothed beyond that bucketing."""
+        hist = self._server_history(server_id, dataset_id)
+        if hist.empty:
+            raise ValueError(f"Unknown server_id: {server_id} in dataset '{dataset_id}'")
+        hist = hist.copy()
+        hist["day"] = pd.to_datetime(hist["timestamp"]).dt.floor("D")
+        if days:
+            cutoff = hist["day"].max() - timedelta(days=days - 1)
+            hist = hist[hist["day"] >= cutoff]
+        daily = hist.groupby("day")["cpu_utilization"].agg(["min", "max", "mean"]).reset_index()
+        daily = daily.sort_values("day")
+        return {
+            "server_id": server_id,
+            "dataset_id": dataset_id,
+            "points": [
+                {
+                    "date": row["day"].strftime("%Y-%m-%d"),
+                    "min": round(float(row["min"]), 2),
+                    "max": round(float(row["max"]), 2),
+                    "avg": round(float(row["mean"]), 2),
+                }
+                for _, row in daily.iterrows()
+            ],
+        }
 
     def _select_model(self, n_points: int) -> tuple[str, str]:
         if n_points < 60:
@@ -412,30 +447,50 @@ class ForecastService:
             "recommendation": recommendation,
         }
 
-    def fleet_overview(self, horizon_days: int = 7, model: str = "xgboost") -> list[dict[str, Any]]:
+    def fleet_overview(self, horizon_days: int = 7, model: str = "xgboost", dataset_id: str = DEFAULT_DATASET_ID) -> list[dict[str, Any]]:
         frame = self._store.frame
         if frame.empty:
             return []
-        subset = frame[frame["model"] == model]
+        # scope to this dataset's own batch predictions - without this, fleet
+        # overview mixes/leaks whichever dataset a model most recently trained on
+        # (see PredictionStore/save_predictions_csv) instead of the one asked for.
+        subset = frame[frame["dataset_id"] == dataset_id]
         if subset.empty:
-            subset = frame
+            return []
+        model_subset = subset[subset["model"] == model]
+        if not model_subset.empty:
+            subset = model_subset
         start = subset["date"].min()
         end = start + timedelta(days=horizon_days - 1)
-        window = subset[(subset["date"] >= start) & (subset["date"] <= end)]
+        window = subset[(subset["date"] >= start) & (subset["date"] <= end)].copy()
         grouped = window.groupby("server_id")["prediction"].agg(["max", "mean"]).reset_index()
+
+        # daily mean per server - source data can be hourly, and a per-hour series
+        # is both noisier and heavier to chart than the fleet needs for a trend view.
+        window["day"] = window["date"].dt.floor("D")
+        daily = window.groupby(["server_id", "day"])["prediction"].mean().reset_index()
 
         out = []
         for _, row in grouped.iterrows():
             server_id = row["server_id"]
-            cpu_cores = self._cores_for(server_id)
+            cpu_cores = self._cores_for(server_id, dataset_id)
             rec = self._rightsizing(float(row["max"]), float(row["mean"]), cpu_cores)
+            series = (
+                daily[daily["server_id"] == server_id]
+                .sort_values("day")[["day", "prediction"]]
+                .rename(columns={"day": "date"})
+            )
             out.append(
                 {
                     "server_id": server_id,
                     "peak_predicted_cpu": round(float(row["max"]), 1),
                     "avg_predicted_cpu": round(float(row["mean"]), 1),
                     "cpu_cores": cpu_cores,
-                    "installed_ram_gb": self._ram_for(server_id),
+                    "installed_ram_gb": self._ram_for(server_id, dataset_id),
+                    "series": [
+                        {"date": d.strftime("%Y-%m-%d"), "prediction": round(float(p), 2)}
+                        for d, p in zip(series["date"], series["prediction"])
+                    ],
                     **rec,
                 }
             )

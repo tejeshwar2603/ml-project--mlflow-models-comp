@@ -1,15 +1,17 @@
 FROM apache/airflow:2.9.3-python3.11
 
-USER root
-RUN apt-get update && apt-get install -y --no-install-recommends build-essential && rm -rf /var/lib/apt/lists/*
-USER airflow
-
+# No apt-get/build-essential step: every dependency below ships a prebuilt
+# manylinux wheel on PyPI, so nothing needs to compile. (Avoids it too - this
+# base image's passwd file doesn't resolve "USER root" cleanly.)
 COPY requirements.txt /tmp/requirements.txt
 
+# python -m pip, not the `pip` script directly - this base image's pip entry-point
+# script is broken (ImportError: cannot import name 'main' from pip._internal.cli.main).
 # CPU-only torch wheel to avoid pulling multi-GB CUDA builds inside the container.
-RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu \
- && pip install --no-cache-dir -r /tmp/requirements.txt \
- && pip install --no-cache-dir kafka-python
+RUN python -m pip install --no-cache-dir --upgrade pip \
+ && python -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu \
+ && python -m pip install --no-cache-dir -r /tmp/requirements.txt \
+ && python -m pip install --no-cache-dir kafka-python
 
 ENV PYTHONPATH=/opt/airflow/project
 WORKDIR /opt/airflow/project

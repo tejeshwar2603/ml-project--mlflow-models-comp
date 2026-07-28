@@ -51,6 +51,8 @@ services:
       POSTGRES_USER: airflow
       POSTGRES_PASSWORD: airflow
       POSTGRES_DB: airflow
+    ports:
+      - "5433:5432"
     volumes:
       - mlflowcomp-postgres-data:/var/lib/postgresql/data
 
@@ -66,7 +68,12 @@ services:
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-postgres/airflow
       AIRFLOW__CORE__LOAD_EXAMPLES: "false"
       AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
-      MLFLOW_TRACKING_URI: sqlite:////opt/airflow/project/mlflow_tracking.db
+      AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session
+      # Postgres, not the old bind-mounted sqlite file - a Linux container reading a
+      # SQLite file that lives on the Windows host via Docker Desktop's bind mount hits
+      # "disk I/O error" reliably (SQLite needs POSIX file locks the bind mount can't
+      # provide). Postgres is a real client-server DB so this isn't an issue.
+      MLFLOW_TRACKING_URI: postgresql+psycopg2://airflow:airflow@airflow-postgres:5432/mlflow
       PROJECT_DIR: /opt/airflow/project
     volumes:
       - ./dags:/opt/airflow/dags

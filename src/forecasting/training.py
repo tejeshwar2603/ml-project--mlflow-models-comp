@@ -12,50 +12,53 @@ from .models import ARIMAForecaster, SARIMAForecaster, XGBoostForecaster, GRUFor
 from .evaluation import evaluate_forecast, compare_models
 
 MODEL_FACTORIES = {
-    "arima": lambda: ARIMAForecaster(order=(3, 1, 1)),
-    "sarima": lambda: SARIMAForecaster(order=(1, 1, 1), seasonal_order=(1, 1, 1, 7)),
+    # order=None -> ARIMAForecaster/SARIMAForecaster determine (p,d,q) and the
+    # seasonal component per-series from ADF/ACF instead of a single fixed order.
+    "arima": lambda: ARIMAForecaster(),
+    "sarima": lambda: SARIMAForecaster(),
     "xgboost": lambda: XGBoostForecaster(params={"objective": "reg:squarederror", "verbosity": 0}, num_round=100),
     "gru": lambda: GRUForecaster(seq_len=14, hidden_size=32, lr=0.005, epochs=5, batch_size=16),
 }
 REGISTERED_MODEL_NAME = "cpu_forecast"
 
+FEATURE_COLUMNS = [
+    "cpu_utilization_lag_1",
+    "cpu_utilization_lag_3",
+    "cpu_utilization_lag_7",
+    "cpu_utilization_lag_14",
+    "cpu_utilization_lag_30",
+    "cpu_utilization_roll_mean_3",
+    "cpu_utilization_roll_std_3",
+    "cpu_utilization_roll_min_3",
+    "cpu_utilization_roll_max_3",
+    "cpu_utilization_roll_mean_7",
+    "cpu_utilization_roll_std_7",
+    "cpu_utilization_roll_min_7",
+    "cpu_utilization_roll_max_7",
+    "day_of_week",
+    "month",
+    "is_weekend",
+]
 
-def time_split(df, date_col="timestamp", test_days=30, val_days=30):
+
+def time_split(df, date_col="timestamp", test_days=30):
+    """Contiguous train/test split - test is the last test_days, train is
+    everything before it. No gap in between: ARIMA/SARIMA forecast forward
+    from where training ends, so train must end exactly where test begins,
+    or the forecast gets evaluated against the wrong dates."""
     last_date = df[date_col].max()
     test_start = last_date - pd.Timedelta(days=test_days - 1)
-    val_start = test_start - pd.Timedelta(days=val_days)
-    train = df[df[date_col] < val_start]
-    val = df[(df[date_col] >= val_start) & (df[date_col] < test_start)]
+    train = df[df[date_col] < test_start]
     test = df[df[date_col] >= test_start]
-    return train, val, test
+    return train, test
 
 
 def _prepare_ml_data(features):
-    cols = [
-        "cpu_utilization",
-        "ram_utilization",
-        "disk_utilization",
-        "network_utilization",
-        "cpu_utilization_lag_1",
-        "cpu_utilization_lag_3",
-        "cpu_utilization_lag_7",
-        "cpu_utilization_lag_14",
-        "cpu_utilization_lag_30",
-        "cpu_utilization_roll_mean_3",
-        "cpu_utilization_roll_std_3",
-        "cpu_utilization_roll_min_3",
-        "cpu_utilization_roll_max_3",
-        "cpu_utilization_roll_mean_7",
-        "cpu_utilization_roll_std_7",
-        "cpu_utilization_roll_min_7",
-        "cpu_utilization_roll_max_7",
-        "cpu_ram_ratio",
-        "cpu_disk_ratio",
-        "day_of_week",
-        "month",
-        "is_weekend",
-    ]
-    return features[cols].fillna(0), features["cpu_utilization"]
+    # cpu_utilization itself (and anything derived from it, like the old
+    # cpu_ram_ratio) is NOT a feature - it's the label. Only lag/rolling values
+    # and calendar features are used, matching exactly what's available at live
+    # forecast time (see forecast_service.FEATURE_COLUMNS / recursive_xgboost_forecast).
+    return features[FEATURE_COLUMNS].fillna(0), features["cpu_utilization"]
 
 
 def _load_split_data(dataset_path: str | Path | None = None):
@@ -67,11 +70,11 @@ def _load_split_data(dataset_path: str | Path | None = None):
     data = validate_data(data)
     features = build_features(data)
     # Uploaded datasets are often much shorter than the 150-day synthetic default;
-    # scale the val/test window down instead of hardcoding 30/30, which would empty
-    # out small datasets entirely.
+    # scale the test window down instead of hardcoding 30, which would empty out
+    # small datasets entirely.
     span_days = max(1, (data["timestamp"].max() - data["timestamp"].min()).days)
     window = min(30, max(3, span_days // 5))
-    return time_split(features, test_days=window, val_days=window)
+    return time_split(features, test_days=window)
 
 
 def train_one_model(name: str, dataset_path: str | Path | None = None, dataset_id: str | None = None) -> dict:
@@ -88,7 +91,7 @@ def train_one_model(name: str, dataset_path: str | Path | None = None, dataset_i
     """
     if name not in MODEL_FACTORIES:
         raise ValueError(f"Unknown model '{name}'. Available: {list(MODEL_FACTORIES)}")
-    train, val, test = _load_split_data(dataset_path)
+    train, test = _load_split_data(dataset_path)
     X_train, y_train = _prepare_ml_data(train)
     X_test, y_test = _prepare_ml_data(test)
     if len(X_train) == 0 or len(X_test) == 0:
@@ -110,7 +113,7 @@ def train_one_model(name: str, dataset_path: str | Path | None = None, dataset_i
         metrics = evaluate_forecast(y_test, y_pred)
         mlflow.log_params({"model": name, "horizon_days": 1, "dataset_id": dataset_id or "synthetic"})
         mlflow.log_metrics(metrics)
-        mlflow.log_artifact(save_predictions_csv(test, y_pred, name))
+        mlflow.log_artifact(save_predictions_csv(test, y_pred, name, dataset_id=dataset_id or "synthetic"))
         model_version = None
         if name == "xgboost" and hasattr(model, "model"):
             info = mlflow.xgboost.log_model(
@@ -126,7 +129,18 @@ def promote_best_xgboost_version(candidate_run_ids: list[str] | None = None) -> 
     """Compare registered cpu_forecast versions by their run's test MAE and point the
     'champion' alias at the best one. Aliases are MLflow 3.x's replacement for the
     deprecated Production/Staging stages - api.py falls back to 'latest version' if
-    no alias is set, so this is what makes that fallback unnecessary going forward."""
+    no alias is set, so this is what makes that fallback unnecessary going forward.
+
+    Only considers versions trained on the synthetic baseline (run tag dataset_id is
+    missing or "synthetic") AND whose logged feature schema matches the current
+    FEATURE_COLUMNS exactly. Two separate failure modes otherwise let an incompatible
+    model silently become champion and break live serving with a feature-names
+    mismatch: (1) ad-hoc dataset uploads can score a numerically lower MAE than the
+    baseline (a tiny/easy uploaded dataset is often trivially easy to fit), and (2) a
+    stale run from before a feature-set change (e.g. the old leaked cpu/ram/disk/
+    network + ratio features) can *also* score an artificially low MAE - leaked
+    features trivially "solve" the regression, so MAE alone can't tell a stale,
+    incompatible model apart from a genuinely good one."""
     client = MlflowClient()
     try:
         versions = client.search_model_versions(f"name='{REGISTERED_MODEL_NAME}'")
@@ -140,9 +154,20 @@ def promote_best_xgboost_version(candidate_run_ids: list[str] | None = None) -> 
         try:
             run = client.get_run(v.run_id)
             mae = run.data.metrics.get("mae")
+            run_dataset_id = run.data.tags.get("dataset_id")
         except Exception:
-            mae = None
-        if mae is not None and mae < best_mae:
+            continue
+        if run_dataset_id not in (None, "synthetic") or mae is None:
+            continue
+        try:
+            model = mlflow.xgboost.load_model(f"models:/{REGISTERED_MODEL_NAME}/{v.version}")
+            feature_names_in = getattr(model, "feature_names_in_", None)
+            feature_names = list(feature_names_in) if feature_names_in is not None else []
+        except Exception:
+            continue
+        if feature_names != FEATURE_COLUMNS:
+            continue
+        if mae < best_mae:
             best_mae, best_version = mae, v.version
 
     if best_version is not None:
@@ -189,12 +214,15 @@ def train_on_dataset(dataset_id: str, dataset_path: str | Path) -> dict:
     }
 
 
-def save_predictions_csv(test_df: pd.DataFrame, y_pred, prefix):
+def save_predictions_csv(test_df: pd.DataFrame, y_pred, prefix, dataset_id: str = "synthetic"):
+    # dataset_id in the filename, not a shared "predictions.csv" - otherwise any
+    # ad-hoc dataset's training run silently clobbers the synthetic baseline's
+    # batch predictions (and vice versa), which is what fleet_overview() reads from.
     output_dir = Path("artifacts") / prefix
     output_dir.mkdir(parents=True, exist_ok=True)
     pred_df = test_df[["server_id", "timestamp"]].copy()
     pred_df["predicted_cpu_utilization"] = y_pred
-    output_path = output_dir / "predictions.csv"
+    output_path = output_dir / f"predictions_{dataset_id}.csv"
     pred_df.to_csv(output_path, index=False)
     return str(output_path)
 

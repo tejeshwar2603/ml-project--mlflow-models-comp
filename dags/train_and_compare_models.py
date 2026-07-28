@@ -53,12 +53,9 @@ def _run_model_comparison(**context):
     from src.forecasting.model_comparison import run_comparison
 
     dataset_id, _ = _dataset_conf(context.get("dag_run"))
-    if dataset_id:
-        print(f"Skipping the full model-comparison analysis for ad-hoc dataset '{dataset_id}' "
-              "(it's scoped to the synthetic baseline dataset).")
-        return
-    results = run_comparison()
-    print(f"Model comparison finished in {results['generated_in_seconds']}s. MAE summary: {results['mae_summary']}")
+    results = run_comparison(dataset_id=dataset_id or "synthetic")
+    print(f"Model comparison ({dataset_id or 'synthetic'}) finished in {results['generated_in_seconds']}s. "
+          f"MAE summary: {results['mae_summary']}")
 
 
 default_args = {

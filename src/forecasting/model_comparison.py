@@ -5,23 +5,31 @@ error distribution, horizon degradation, dataset-size impact, null-value
 handling, a radar scorecard, and business metrics) plus a Diebold-Mariano
 significance test and a per-server error heatmap.
 
-Everything here is measured against THIS repo's actual synthetic dataset
+By default this is measured against THIS repo's built-in synthetic dataset
 and THIS repo's actual model/feature code (not generic ML folklore) - where
 a result differs from common wisdom (e.g. "XGBoost needs 30+ days here
 because of the lag_30 feature", not "XGBoost works fine on 7 days"), that's
 reported honestly rather than forced to match expectations.
 
-Run manually (not triggered by anything automatically - there's no
-scheduler/Airflow in this repo):
+It can also run against any dataset uploaded through POST /datasets/upload
+(pass its dataset_id) - study servers, the forecast-vs-actual example server,
+and the dataset-size tiers all adapt to whatever that dataset actually
+contains instead of assuming the synthetic dataset's shape.
 
-    python -m src.forecasting.model_comparison
+Run manually (not triggered automatically on upload - it takes minutes, so
+it's exposed as an explicit POST /datasets/{id}/model-comparison instead):
 
-Writes:
-  - artifacts/model_comparison/results.json   (consumed by GET /model-comparison)
-  - artifacts/model_comparison/plots/*.png    (also logged to MLflow)
-  - an MLflow run "model_comparison_analysis" with all plots + metrics + the JSON
+    python -m src.forecasting.model_comparison [dataset_id]
+
+Writes (per dataset_id; "synthetic" keeps the original unscoped filenames):
+  - artifacts/model_comparison/results.json               (consumed by GET /model-comparison)
+  - artifacts/model_comparison/results_<dataset_id>.json  (for non-synthetic datasets)
+  - artifacts/model_comparison/plots/*.png                (synthetic; also logged to MLflow)
+  - artifacts/model_comparison/plots_<dataset_id>/*.png   (non-synthetic; also logged to MLflow)
+  - an MLflow run "model_comparison_analysis[_<dataset_id>]" with all plots + metrics + the JSON
 """
 import json
+import sys
 import time
 import warnings
 from pathlib import Path
@@ -39,8 +47,8 @@ from statsmodels.tsa.statespace.sarimax import SARIMAX
 
 from .data import generate_synthetic_data, validate_data
 from .evaluation import evaluate_forecast
-from .features import build_features
-from .forecast_service import recursive_xgboost_forecast
+from .features import build_features, validate_and_fill
+from .forecast_service import UPLOADED_DATASETS_DIR, recursive_xgboost_forecast
 from .models import ARIMAForecaster, GRUForecaster, SARIMAForecaster, XGBoostForecaster
 from .training import _prepare_ml_data, time_split
 
@@ -51,8 +59,9 @@ PLOTS_DIR = ARTIFACTS_DIR / "plots"
 
 LIVE_MODELS = ["arima", "sarima", "xgboost"]
 ALL_MODELS = ["arima", "sarima", "xgboost", "gru"]
-STUDY_SERVERS = [f"server-{i:03d}" for i in range(1, 6)]  # 5 servers for expensive studies
+STUDY_SERVERS = [f"server-{i:03d}" for i in range(1, 6)]  # synthetic dataset's 5 study servers
 EXAMPLE_SERVER = "server-001"
+MIN_TOTAL_DAYS = 40  # below this, most feature-based tabs would just be empty/None
 
 HORIZONS = [1, 3, 7, 14, 21, 30]
 ORIGIN_FRACTIONS = [0.55, 0.7, 0.85]
@@ -60,6 +69,42 @@ MISSING_RATES = [0.0, 0.05, 0.10, 0.20, 0.30, 0.50]
 DATASET_SIZE_TIERS = {"7d": 7, "28d": 28, "60d": 60, "90d": 90, "150d": 150, "300d": 300}
 UNDERSIZED_PEAK_THRESHOLD = 85.0
 DECISION_HORIZON = 7  # classic capacity-planning window for the business-metrics study
+
+
+# ---------------------------------------------------------------------------
+# Dataset resolution: synthetic (fixed, backward-compatible) vs. an uploaded dataset
+# ---------------------------------------------------------------------------
+def _load_raw_dataset(dataset_id: str) -> pd.DataFrame:
+    """Real uploads (unlike the synthetic generator) can have genuine missing
+    cpu/ram/disk/network readings. build_features() imputes those for the main
+    train/test split via validate_and_fill(), but the walk-forward/dataset-size/
+    null-handling studies below work off this raw frame directly - impute it here
+    too, or their MAE/MAPE aggregates silently collapse to NaN (which then fails
+    to even serialize as JSON) the moment one input value is missing."""
+    if dataset_id == "synthetic":
+        raw = validate_data(generate_synthetic_data(n_servers=20, n_days=150, seed=42))
+    else:
+        path = UPLOADED_DATASETS_DIR / f"{dataset_id}.csv"
+        if not path.exists():
+            raise ValueError(
+                f"No persisted data for dataset_id={dataset_id!r} (expected {path}). "
+                "Upload it via POST /datasets/upload first."
+            )
+        raw = validate_data(pd.read_csv(path))
+    return validate_and_fill(raw)
+
+
+def _resolve_study_servers(raw: pd.DataFrame, dataset_id: str) -> tuple[list[str], str]:
+    """5 study servers + 1 example server, matching the synthetic dataset's fixed IDs
+    when dataset_id == "synthetic" (so its results stay identical run to run), or
+    picked from whatever server IDs the uploaded dataset actually has otherwise."""
+    if dataset_id == "synthetic":
+        return STUDY_SERVERS, EXAMPLE_SERVER
+    servers = sorted(raw["server_id"].unique().tolist())
+    if not servers:
+        raise ValueError(f"Dataset {dataset_id!r} has no servers after validation.")
+    study_servers = servers[:5]
+    return study_servers, study_servers[0]
 
 
 def _safe_mape(actual, pred):
@@ -152,11 +197,11 @@ def _error_distribution(y_test: pd.Series, model_results: dict) -> dict:
 # ---------------------------------------------------------------------------
 # Walk-forward study: powers horizon degradation (tab 3) + business metrics (tab 7)
 # ---------------------------------------------------------------------------
-def _walk_forward_study(raw_df: pd.DataFrame, xgb_predict_fn) -> dict:
+def _walk_forward_study(raw_df: pd.DataFrame, xgb_predict_fn, study_servers: list[str]) -> dict:
     horizon_errors = {m: {h: [] for h in HORIZONS} for m in LIVE_MODELS}
     decisions = {m: [] for m in LIVE_MODELS}  # list of (predicted_flag, actual_flag)
 
-    for server_id in STUDY_SERVERS:
+    for server_id in study_servers:
         hist = raw_df[raw_df["server_id"] == server_id].sort_values("timestamp").reset_index(drop=True)
         n = len(hist)
         for frac in ORIGIN_FRACTIONS:
@@ -234,14 +279,24 @@ def _walk_forward_study(raw_df: pd.DataFrame, xgb_predict_fn) -> dict:
 # ---------------------------------------------------------------------------
 # Tab 4: dataset size impact / learning curves
 # ---------------------------------------------------------------------------
-def _dataset_size_study() -> dict:
-    big = validate_data(generate_synthetic_data(n_servers=len(STUDY_SERVERS), n_days=340, seed=42))
-    test_block = big.groupby("server_id", group_keys=False).apply(lambda g: g.tail(30))
-    train_pool = big.groupby("server_id", group_keys=False).apply(lambda g: g.iloc[:-30])
+def _dataset_size_study(size_source: pd.DataFrame, tiers: dict[str, int]) -> dict:
+    """size_source should have enough per-server history to slice every tier out of
+    (the synthetic path passes a freshly generated, larger-than-usual 340-day set so
+    the 300-day tier is testable; the live-dataset path passes whatever history that
+    dataset actually has, with `tiers` already filtered down to what's feasible)."""
+    if not tiers:
+        return {
+            "tiers": [],
+            "tier_days": {},
+            "mae_by_model": {m: {} for m in ALL_MODELS},
+            "failure_notes": {m: {} for m in ALL_MODELS},
+        }
+    test_block = size_source.groupby("server_id", group_keys=False).apply(lambda g: g.tail(30))
+    train_pool = size_source.groupby("server_id", group_keys=False).apply(lambda g: g.iloc[:-30])
 
     results = {m: {} for m in ALL_MODELS}
     notes = {m: {} for m in ALL_MODELS}
-    for tier_label, tier_days in DATASET_SIZE_TIERS.items():
+    for tier_label, tier_days in tiers.items():
         tier_train = train_pool.groupby("server_id", group_keys=False).apply(lambda g: g.tail(tier_days))
         actual_by_server = {s: g.sort_values("timestamp")["cpu_utilization"].values for s, g in test_block.groupby("server_id")}
 
@@ -305,17 +360,28 @@ def _dataset_size_study() -> dict:
             results["gru"][tier_label] = None
             notes["gru"][tier_label] = str(exc)[:160]
 
-    return {"tiers": list(DATASET_SIZE_TIERS.keys()), "tier_days": DATASET_SIZE_TIERS, "mae_by_model": results, "failure_notes": notes}
+    return {"tiers": list(tiers.keys()), "tier_days": tiers, "mae_by_model": results, "failure_notes": notes}
 
 
 # ---------------------------------------------------------------------------
 # Tab 5: null-value handling robustness
 # ---------------------------------------------------------------------------
-def _null_handling_study(raw_df: pd.DataFrame, rng: np.random.Generator) -> dict:
+def _feasible_tiers(raw: pd.DataFrame, study_servers: list[str]) -> dict[str, int]:
+    """Which DATASET_SIZE_TIERS this dataset actually has enough history for, per
+    study server (30 days reserved as the size-study's own held-out test block)."""
+    subset = raw[raw["server_id"].isin(study_servers)]
+    per_server_days = subset.groupby("server_id").size()
+    if per_server_days.empty:
+        return {}
+    train_days_available = int(per_server_days.min()) - 30
+    return {label: days for label, days in DATASET_SIZE_TIERS.items() if days <= train_days_available}
+
+
+def _null_handling_study(raw_df: pd.DataFrame, rng: np.random.Generator, study_servers: list[str]) -> dict:
     results = {m: {} for m in LIVE_MODELS}
     for rate in MISSING_RATES:
         maes = {m: [] for m in LIVE_MODELS}
-        for server_id in STUDY_SERVERS:
+        for server_id in study_servers:
             hist = raw_df[raw_df["server_id"] == server_id].sort_values("timestamp").reset_index(drop=True)
             n = len(hist)
             cutoff = n - 30
@@ -493,8 +559,8 @@ def _per_server_heatmap(test: pd.DataFrame, y_test: pd.Series, model_results: di
 # ---------------------------------------------------------------------------
 # Plotting (logged to MLflow + saved to artifacts/model_comparison/plots)
 # ---------------------------------------------------------------------------
-def _save_plots(results: dict) -> list[Path]:
-    PLOTS_DIR.mkdir(parents=True, exist_ok=True)
+def _save_plots(results: dict, plots_dir: Path) -> list[Path]:
+    plots_dir.mkdir(parents=True, exist_ok=True)
     paths = []
 
     # Tab 1: forecast vs actual + residuals
@@ -512,7 +578,7 @@ def _save_plots(results: dict) -> list[Path]:
     ax2.set_title("Residuals (predicted - actual)")
     ax2.tick_params(axis="x", rotation=45)
     fig.tight_layout()
-    p = PLOTS_DIR / "01_forecast_vs_actual.png"
+    p = plots_dir / "01_forecast_vs_actual.png"
     fig.savefig(p, dpi=110)
     plt.close(fig)
     paths.append(p)
@@ -539,7 +605,7 @@ def _save_plots(results: dict) -> list[Path]:
     axes[1].boxplot(box_data, tick_labels=ALL_MODELS, showfliers=False)
     axes[1].set_title("Error box plot")
     fig.tight_layout()
-    p = PLOTS_DIR / "02_error_distribution.png"
+    p = plots_dir / "02_error_distribution.png"
     fig.savefig(p, dpi=110)
     plt.close(fig)
     paths.append(p)
@@ -556,7 +622,7 @@ def _save_plots(results: dict) -> list[Path]:
     ax.set_title("Horizon degradation (walk-forward)")
     ax.legend()
     fig.tight_layout()
-    p = PLOTS_DIR / "03_horizon_degradation.png"
+    p = plots_dir / "03_horizon_degradation.png"
     fig.savefig(p, dpi=110)
     plt.close(fig)
     paths.append(p)
@@ -575,7 +641,7 @@ def _save_plots(results: dict) -> list[Path]:
     ax.set_title("Dataset size impact / learning curves")
     ax.legend()
     fig.tight_layout()
-    p = PLOTS_DIR / "04_dataset_size_impact.png"
+    p = plots_dir / "04_dataset_size_impact.png"
     fig.savefig(p, dpi=110)
     plt.close(fig)
     paths.append(p)
@@ -594,7 +660,7 @@ def _save_plots(results: dict) -> list[Path]:
     ax.set_title("Robustness to missing data")
     ax.legend()
     fig.tight_layout()
-    p = PLOTS_DIR / "05_null_handling.png"
+    p = plots_dir / "05_null_handling.png"
     fig.savefig(p, dpi=110)
     plt.close(fig)
     paths.append(p)
@@ -615,7 +681,7 @@ def _save_plots(results: dict) -> list[Path]:
     ax.set_title("Model tradeoff radar (0-100)")
     ax.legend(loc="upper right", bbox_to_anchor=(1.3, 1.1))
     fig.tight_layout()
-    p = PLOTS_DIR / "06_radar_chart.png"
+    p = plots_dir / "06_radar_chart.png"
     fig.savefig(p, dpi=110)
     plt.close(fig)
     paths.append(p)
@@ -640,7 +706,7 @@ def _save_plots(results: dict) -> list[Path]:
     ax2.set_title("Training time vs accuracy")
     ax2.legend()
     fig.tight_layout()
-    p = PLOTS_DIR / "07_business_metrics.png"
+    p = plots_dir / "07_business_metrics.png"
     fig.savefig(p, dpi=110)
     plt.close(fig)
     paths.append(p)
@@ -658,7 +724,7 @@ def _save_plots(results: dict) -> list[Path]:
     ax.set_title("Per-server MAE heatmap")
     fig.colorbar(im, ax=ax, label="MAE")
     fig.tight_layout()
-    p = PLOTS_DIR / "08_per_server_heatmap.png"
+    p = plots_dir / "08_per_server_heatmap.png"
     fig.savefig(p, dpi=110)
     plt.close(fig)
     paths.append(p)
@@ -669,12 +735,25 @@ def _save_plots(results: dict) -> list[Path]:
 # ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
-def run_comparison() -> dict:
+def run_comparison(dataset_id: str = "synthetic") -> dict:
     t_start = time.time()
-    print("Generating base dataset (20 servers x 150 days, seed=42)...")
-    raw = validate_data(generate_synthetic_data(n_servers=20, n_days=150, seed=42))
+    if dataset_id == "synthetic":
+        print("Generating base dataset (20 servers x 150 days, seed=42)...")
+    else:
+        print(f"Loading uploaded dataset {dataset_id!r}...")
+    raw = _load_raw_dataset(dataset_id)
+
+    total_days = (raw["timestamp"].max() - raw["timestamp"].min()).days
+    if total_days < MIN_TOTAL_DAYS:
+        raise ValueError(
+            f"Dataset {dataset_id!r} only spans {total_days} days - need at least {MIN_TOTAL_DAYS} "
+            "for the comparison studies (lag/rolling features + a 30-day held-out test block) to "
+            "produce meaningful results."
+        )
+    study_servers, example_server = _resolve_study_servers(raw, dataset_id)
+
     features = build_features(raw)
-    train, val, test = time_split(features, test_days=30, val_days=30)
+    train, test = time_split(features, test_days=30)
     raw_history = raw[raw["timestamp"] < test["timestamp"].min()]  # for walk-forward/size/null studies
 
     print("Fitting all 4 models on the standard train/test split...")
@@ -682,19 +761,29 @@ def run_comparison() -> dict:
     fitted_xgb_regressor = model_results.pop("_fitted_xgb_regressor")
 
     print("Tab 1: forecast vs actual...")
-    forecast_vs_actual = _forecast_vs_actual(test, y_test, model_results, EXAMPLE_SERVER)
+    forecast_vs_actual = _forecast_vs_actual(test, y_test, model_results, example_server)
     print("Tab 2: error distribution...")
     error_distribution = _error_distribution(y_test, model_results)
 
     print("Tab 3 + 7: walk-forward horizon degradation + business metrics (this takes a few minutes)...")
-    walk_forward = _walk_forward_study(raw_history, fitted_xgb_regressor.predict)
+    walk_forward = _walk_forward_study(raw_history, fitted_xgb_regressor.predict, study_servers)
 
     print("Tab 4: dataset size impact / learning curves...")
-    dataset_size = _dataset_size_study()
+    if dataset_id == "synthetic":
+        # A fresh, larger-than-usual synthetic pull so the 300-day tier is testable -
+        # the standard 150-day `raw` above doesn't have enough history for that.
+        size_source = validate_data(generate_synthetic_data(n_servers=len(study_servers), n_days=340, seed=42))
+        size_tiers = dict(DATASET_SIZE_TIERS)
+    else:
+        # Real datasets can't be "generated bigger" - use whatever history actually
+        # exists and only attempt the tiers that fit within it.
+        size_source = raw[raw["server_id"].isin(study_servers)]
+        size_tiers = _feasible_tiers(raw, study_servers)
+    dataset_size = _dataset_size_study(size_source, size_tiers)
 
     print("Tab 5: null-value handling robustness...")
     rng = np.random.default_rng(7)
-    null_handling = _null_handling_study(raw_history, rng)
+    null_handling = _null_handling_study(raw_history, rng, study_servers)
 
     print("Tab 6: radar scorecard...")
     radar = _radar_scores(model_results, y_test, null_handling, walk_forward)
@@ -706,6 +795,7 @@ def run_comparison() -> dict:
     mae_summary = {m: round(_safe_mae(np.asarray(y_test), model_results[m]["y_pred"]), 3) for m in ALL_MODELS}
 
     results = {
+        "dataset_id": dataset_id,
         "generated_in_seconds": None,  # filled below
         "mae_summary": mae_summary,
         "fit_seconds": {m: model_results[m]["fit_seconds"] for m in ALL_MODELS},
@@ -721,21 +811,24 @@ def run_comparison() -> dict:
         "_model_results": {m: {"y_pred": model_results[m]["y_pred"].tolist(), "fit_seconds": model_results[m]["fit_seconds"]} for m in ALL_MODELS},
     }
 
+    suffix = "" if dataset_id == "synthetic" else f"_{dataset_id}"
+    plots_dir = ARTIFACTS_DIR / f"plots{suffix}"
     ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
-    plot_paths = _save_plots(results)
+    plot_paths = _save_plots(results, plots_dir)
 
     elapsed = round(time.time() - t_start, 1)
     results["generated_in_seconds"] = elapsed
     # Strip internal-only fields before persisting the public JSON contract
     public_results = {k: v for k, v in results.items() if not k.startswith("_")}
 
-    results_path = ARTIFACTS_DIR / "results.json"
+    results_path = ARTIFACTS_DIR / f"results{suffix}.json"
     results_path.write_text(json.dumps(public_results, indent=2))
     print(f"Wrote {results_path} in {elapsed}s")
 
     print("Logging to MLflow...")
     mlflow.set_experiment("cpu_forecasting")
-    with mlflow.start_run(run_name="model_comparison_analysis"):
+    with mlflow.start_run(run_name=f"model_comparison_analysis{suffix}"):
+        mlflow.set_tag("dataset_id", dataset_id)
         for m, mae in mae_summary.items():
             mlflow.log_metric(f"{m}_test_mae", mae)
         for m, secs in results["fit_seconds"].items():
@@ -745,10 +838,10 @@ def run_comparison() -> dict:
         mlflow.log_artifact(str(results_path), artifact_path="model_comparison")
         for p in plot_paths:
             mlflow.log_artifact(str(p), artifact_path="model_comparison/plots")
-    print("Done. Logged plots + results.json to the 'cpu_forecasting' MLflow experiment (run: model_comparison_analysis).")
+    print(f"Done. Logged plots + {results_path.name} to the 'cpu_forecasting' MLflow experiment (run: model_comparison_analysis{suffix}).")
 
     return public_results
 
 
 if __name__ == "__main__":
-    run_comparison()
+    run_comparison(sys.argv[1] if len(sys.argv) > 1 else "synthetic")

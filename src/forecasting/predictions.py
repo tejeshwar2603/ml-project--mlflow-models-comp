@@ -80,7 +80,27 @@ def _is_capacity_question(question: str) -> bool:
 class PredictionStore:
     def __init__(self, artifacts_dir: str | Path = DEFAULT_ARTIFACTS_DIR) -> None:
         self.artifacts_dir = Path(artifacts_dir)
-        self.frame = self._load_predictions()
+        self._loaded_mtime: float | None = None
+        self._frame = pd.DataFrame(columns=["server_id", "date", "prediction", "model", "dataset_id"])
+        self._refresh_if_stale()
+
+    def _current_mtime(self) -> float:
+        return max((p.stat().st_mtime for p in self.artifacts_dir.rglob("predictions*.csv")), default=0.0)
+
+    def _refresh_if_stale(self) -> None:
+        # predictions*.csv is rewritten by the Airflow DAG's refresh_model_comparison
+        # task on every run; without this check a long-lived API process would keep
+        # serving whatever was on disk at startup forever, silently going stale (or
+        # briefly outright wrong if it started mid-write of a new batch).
+        mtime = self._current_mtime()
+        if self._loaded_mtime is None or mtime != self._loaded_mtime:
+            self._frame = self._load_predictions()
+            self._loaded_mtime = mtime
+
+    @property
+    def frame(self) -> pd.DataFrame:
+        self._refresh_if_stale()
+        return self._frame
 
     def _load_predictions(self) -> pd.DataFrame:
         rows: list[pd.DataFrame] = []
@@ -93,6 +113,11 @@ class PredictionStore:
                 continue
             df = df.copy()
             df["model"] = path.parent.name or path.stem
+            # predictions_{dataset_id}.csv (new layout) vs bare predictions.csv
+            # (pre-existing files from before per-dataset splitting) - treat the latter
+            # as the synthetic baseline, matching how training.py used to name it.
+            stem = path.stem
+            df["dataset_id"] = stem[len("predictions_"):] if stem.startswith("predictions_") else "synthetic"
             server_col = next(
                 (col for col in ("server_id", "server", "host") if col in df.columns),
                 None,
@@ -122,9 +147,9 @@ class PredictionStore:
             if pred_col is None:
                 continue
             df["prediction"] = pd.to_numeric(df[pred_col], errors="coerce")
-            rows.append(df[["server_id", "date", "prediction", "model"]])
+            rows.append(df[["server_id", "date", "prediction", "model", "dataset_id"]])
         if not rows:
-            return pd.DataFrame(columns=["server_id", "date", "prediction", "model"])
+            return pd.DataFrame(columns=["server_id", "date", "prediction", "model", "dataset_id"])
         frame = pd.concat(rows, ignore_index=True)
         frame = frame.dropna(subset=["date", "prediction"])
         return frame.sort_values(["server_id", "date", "model"]).reset_index(drop=True)

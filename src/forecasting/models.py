@@ -4,10 +4,65 @@ from sklearn.base import RegressorMixin
 from sklearn.preprocessing import StandardScaler
 from statsmodels.tsa.arima.model import ARIMA
 from statsmodels.tsa.statespace.sarimax import SARIMAX
+from statsmodels.tsa.stattools import adfuller, acf
 import xgboost as xgb
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
+
+
+def check_stationarity(series, alpha: float = 0.05) -> tuple[bool, float]:
+    """Augmented Dickey-Fuller test. H0: series has a unit root (non-stationary).
+    p < alpha => reject H0 => stationary. Too few points for a meaningful ADF
+    test defaults to "assume stationary" (d=0) rather than guessing d=1."""
+    series = np.asarray(series, dtype=float)
+    if len(series) < 8:
+        return True, 1.0
+    try:
+        _, p_value = adfuller(series, autolag="AIC")[:2]
+        return p_value < alpha, p_value
+    except Exception:
+        return True, 1.0
+
+
+def detect_weekly_seasonality(series, period: int = 7) -> tuple[bool, float]:
+    """ACF at the weekly lag, compared against the standard 1.96/sqrt(n)
+    significance band. Needs at least 2 full periods to mean anything."""
+    series = np.asarray(series, dtype=float)
+    if len(series) < 2 * period:
+        return False, 0.0
+    try:
+        nlags = min(21, len(series) // 2 - 1)
+        if nlags <= period:
+            return False, 0.0
+        acf_values = acf(series, nlags=nlags, fft=True)
+        acf_at_period = float(acf_values[period])
+        threshold = 1.96 / np.sqrt(len(series))
+        return abs(acf_at_period) > threshold, acf_at_period
+    except Exception:
+        return False, 0.0
+
+
+def determine_arima_order(series, default_pq: tuple[int, int] = (1, 1)) -> tuple[int, int, int]:
+    """d from the ADF test; p/q kept small and fixed - with the short, noisy
+    per-server series this project deals with, searching p/q (e.g. auto_arima)
+    overfits far more often than it helps."""
+    is_stationary, _ = check_stationarity(series)
+    p, q = default_pq
+    return (p, 0 if is_stationary else 1, q)
+
+
+def determine_sarima_order(series, period: int = 7) -> tuple[tuple[int, int, int], tuple[int, int, int, int]]:
+    """ARIMA order from ADF, seasonal order enabled only if ACF actually shows a
+    weekly pattern with enough history to fit it - otherwise SARIMA degrades to
+    plain ARIMA instead of fitting a seasonal component to noise."""
+    order = determine_arima_order(series)
+    has_seasonality, _ = detect_weekly_seasonality(series, period)
+    if has_seasonality and len(series) >= 3 * period:
+        seasonal_order = (1, 0, 1, period)
+    else:
+        seasonal_order = (0, 0, 0, 0)
+    return order, seasonal_order
 
 
 class BaseForecaster:
@@ -53,27 +108,43 @@ class ServerSeriesForecaster(BaseForecaster):
 
 
 class ARIMAForecaster(ServerSeriesForecaster):
-    def __init__(self, order=(5, 1, 0)):
+    def __init__(self, order=None):
         super().__init__()
+        # None = determine (p,d,q) per-series from an ADF stationarity test
+        # instead of assuming one fixed order fits every server's series.
         self.order = order
 
     def _fit_single(self, series):
-        model = ARIMA(series, order=self.order)
-        return model.fit()
+        order = self.order or determine_arima_order(series)
+        try:
+            return ARIMA(series, order=order).fit()
+        except Exception:
+            return ARIMA(series, order=(1, 0, 0)).fit()
 
     def _predict_single(self, fitted_model, n_points, forecast_horizon):
         return fitted_model.forecast(steps=n_points)
 
 
 class SARIMAForecaster(ServerSeriesForecaster):
-    def __init__(self, order=(1, 1, 1), seasonal_order=(1, 1, 1, 7)):
+    def __init__(self, order=None, seasonal_order=None):
         super().__init__()
+        # None = determine both orders per-series from ADF (trend) + ACF (weekly
+        # seasonality) instead of forcing the same seasonal component onto every
+        # server regardless of whether its series actually shows one.
         self.order = order
         self.seasonal_order = seasonal_order
 
     def _fit_single(self, series):
-        model = SARIMAX(series, order=self.order, seasonal_order=self.seasonal_order, enforce_stationarity=False, enforce_invertibility=False)
-        return model.fit(disp=False)
+        if self.order is not None and self.seasonal_order is not None:
+            order, seasonal_order = self.order, self.seasonal_order
+        else:
+            order, seasonal_order = determine_sarima_order(series)
+        try:
+            model = SARIMAX(series, order=order, seasonal_order=seasonal_order, enforce_stationarity=False, enforce_invertibility=False)
+            return model.fit(disp=False)
+        except Exception:
+            model = ARIMA(series, order=order)
+            return model.fit()
 
     def _predict_single(self, fitted_model, n_points, forecast_horizon):
         return fitted_model.forecast(steps=n_points)

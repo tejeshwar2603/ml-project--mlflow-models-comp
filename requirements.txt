@@ -18,3 +18,4 @@ matplotlib>=3.8
 kafka-python>=2.0
 requests>=2.31
 psycopg2-binary>=2.9
+boto3>=1.34

@@ -1,12 +1,13 @@
 # CPU Forecasting & AIOps Platform — Architecture
 
 Time-series CPU-utilization forecasting (ARIMA / SARIMA / XGBoost / GRU) with an
-MLflow-tracked training pipeline, Airflow orchestration, Kafka streaming ingestion,
-and a chatbot dashboard for capacity-planning questions. This describes the actual
-current wiring of this repository, not an idealized target.
+MLflow-tracked training pipeline, Airflow orchestration, three dataset ingestion
+paths (manual upload, Kafka streaming, MinIO object storage), and a chatbot
+dashboard for capacity-planning questions. This describes the actual current
+wiring of this repository, not an idealized target.
 
 **Stack**: FastAPI `:8000` · MLflow `:5000` · Postgres `:5433` · Airflow `:8090` ·
-Kafka `:9095` · Zookeeper `:2182` · Docker Compose
+Kafka `:9095` · Zookeeper `:2182` · MinIO `:9010`/`:9011` · Docker Compose
 
 ## System diagram
 
@@ -16,6 +17,7 @@ flowchart TB
         PROD["producer.py<br/>simulated server-metrics"]
         TOPIC[["Kafka topic<br/>server-metrics"]]
         CONS["consumer.py<br/>buffers, flushes every N msgs"]
+        MINIO[("MinIO bucket<br/>cpu-utilization-datasets")]
     end
 
     subgraph SRV["SERVING API — :8000"]
@@ -46,6 +48,8 @@ flowchart TB
     end
 
     PROD --> TOPIC --> CONS -- "POST /datasets/upload" --> API
+    MINIO -- "bucket-notification webhook<br/>POST /storage/events" --> API
+    API -- "GetObject (boto3)" --> MINIO
     API --> FS
     FS --> FEAT --> MODELS
     API -- "POST /datasets/upload, /train" --> TRAIN
@@ -60,19 +64,24 @@ flowchart TB
     FS -- "GET /servers, /forecast, /capacity-overview" --> HTML
     API --> BOT --> HTML
     MLF -. "@champion model" .-> FS
+
+    classDef ing fill:#0d7d72,stroke:#0d7d72,color:#fff
+    class MINIO ing
 ```
 
 Solid arrows are calls that happen on every request; the dotted arrow is the model
 registry handing the currently-promoted XGBoost version back to the serving layer at
 process startup. Airflow's path is redundant with the API's own in-process
 training/comparison calls — it exists so the same pipeline can also run on a daily
-schedule with no HTTP request involved.
+schedule with no HTTP request involved. MinIO's arrow is bidirectional: it pushes a
+webhook the instant an object lands, and the API pulls that object's bytes back out
+over the S3 API in response.
 
 ## Request & data flow, end to end
 
 | # | Step | Where |
 |---|------|-------|
-| 1 | A dataset arrives — either a human uploads a CSV/XLSX, or `consumer.py` flushes a batch of Kafka readings — as an HTTP multipart POST. | `POST /datasets/upload` |
+| 1 | A dataset arrives via one of three paths: a human uploads a CSV/XLSX, `consumer.py` flushes a batch of Kafka readings, or a `.csv`/`.xlsx` object is created/overwritten in the MinIO bucket (MinIO's own bucket notification fires the instant this happens). | `POST /datasets/upload`, `POST /storage/events` |
 | 2 | Schema-validated, timestamp-parsed, deduplicated, persisted to disk, and registered in the in-memory dataset map. | `forecast_service.register_uploaded_dataset()` |
 | 3 | All 4 models are fit synchronously in the request (arima, sarima, xgboost, gru) against that one dataset; XGBoost gets registered as a new MLflow model version (never promoted to champion). | `training.train_on_dataset()` |
 | 4 | Airflow's REST API is notified (best-effort, 3s timeout) to also run the full pipeline for this dataset on its own schedule/queue. | `_train_dataset_and_notify_airflow()` |
@@ -82,13 +91,31 @@ schedule with no HTTP request involved.
 
 ## Layers
 
-### 1. Ingestion — Kafka
+### 1. Ingestion — Kafka & MinIO
 
-Simulates a fleet streaming CPU/RAM/disk/network readings; the consumer buffers and
-upserts them into the same upload pipeline a human would use.
+Three ways a dataset enters the system, all converging on the same
+`register_uploaded_dataset()` → train → notify-Airflow pipeline:
 
-- `src/streaming/producer.py` — publishes synthetic readings to the `server-metrics` topic.
+- `src/streaming/producer.py` — publishes synthetic readings to the Kafka `server-metrics` topic.
 - `src/streaming/consumer.py` — batches messages and POSTs them to `/datasets/upload`.
+- **MinIO** (`:9010` API / `:9011` console) — an S3-compatible object store for
+  "drop a file, it just gets ingested" real-time feeds. A `.csv`/`.xlsx` object
+  created or overwritten in the `cpu-utilization-datasets` bucket fires a bucket
+  notification webhook at `POST /storage/events` (bearer-token authenticated via
+  `MINIO_WEBHOOK_TOKEN`); the handler fetches the object's bytes back out over the
+  S3 API and feeds them through the identical parsing/registration path a manual
+  upload uses. The dataset ID is derived from the object key (`live/foo.csv` →
+  `minio-foo`), so the same key being overwritten repeatedly — the real-time-feed
+  case — upserts one dataset in place rather than creating a new one each time.
+  - `src/forecasting/object_storage.py` — the boto3 S3 client (`fetch_object()`).
+  - `src/forecasting/api.py`'s `POST /storage/events` — the webhook handler.
+  - `docker-compose.yml`'s `minio` service — registers the webhook notification
+    target via `MINIO_NOTIFY_WEBHOOK_*` env vars at startup (not a runtime
+    `mc admin config set` + restart, which needs an interactive TTY that doesn't
+    exist in a non-interactive init container).
+  - `docker-compose.yml`'s `minio-init` service — one-shot: creates the bucket,
+    binds `s3:ObjectCreated:*` events for `.csv`/`.xlsx` to that already-registered
+    webhook target.
 
 ### 2. Serving API — FastAPI, `:8000`
 
@@ -176,13 +203,14 @@ LLM chatbot grounded in a local RAG vector store.
 | POST | `/datasets/{id}/train` | Re-trigger training for an already-uploaded dataset. |
 | GET | `/model-comparison` | Read the 7-tab offline benchmark for a dataset (`?dataset_id=`). |
 | POST | `/datasets/{id}/model-comparison` | Run the offline benchmark in the background. |
+| POST | `/storage/events` | MinIO bucket-notification webhook target — bearer-token authenticated, not meant to be called directly. |
 | POST | `/chat`, `/llm/*` | Chatbot Q&A, capacity summaries, ticket drafts, root-cause, exec reports. |
 | GET | `/ui` | The dashboard. |
 
 ## Running it
 
 ```bash
-# 1. Infra: Postgres, Kafka/Zookeeper, Airflow webserver+scheduler
+# 1. Infra: Postgres, Kafka/Zookeeper, Airflow webserver+scheduler, MinIO
 docker compose up -d
 
 # 2. MLflow tracking server (same Postgres backend as Airflow)
@@ -198,7 +226,10 @@ python run_api.py
 ```
 
 The dashboard is then at `http://localhost:8000/ui`, MLflow at
-`http://localhost:5000`, and Airflow at `http://localhost:8090`.
+`http://localhost:5000`, Airflow at `http://localhost:8090`, and the MinIO console
+at `http://localhost:9011` (`minioadmin`/`minioadmin`) — drop a `.csv` into the
+`cpu-utilization-datasets` bucket there and it'll appear under `/datasets` within
+moments, no upload button required.
 
 Example `/predict` payload (must match `FEATURE_COLUMNS` exactly):
 
@@ -251,6 +282,10 @@ dataset_id), which builds this feature vector for you from a server's history.
 - **Chart.js crash** (`chatbot_ui.html`) — charts were recreated on dataset switch
   without destroying the previous instance. The Model Comparison tab is now
   dataset-aware with a run/poll flow.
+- **Duplicated file-parsing logic** (`api.py`) — the CSV/XLSX parsing in
+  `/datasets/upload` is now a single shared `ForecastService.read_tabular_bytes()`,
+  reused by the new MinIO webhook handler, so the two ingestion paths can't
+  silently drift on what file types/parsing they accept.
 
 ### Still open
 
@@ -268,6 +303,15 @@ dataset_id), which builds this feature vector for you from a server's history.
   assumes daily-cadence data; an hourly dataset gets ~700 points crammed under 30
   date labels, and ARIMA/SARIMA get scored on a much longer horizon than the chart
   implies.
+- **MinIO's webhook target is a fixed host/port** (`docker-compose.yml`) —
+  `MINIO_NOTIFY_WEBHOOK_ENDPOINT_datasets` hardcodes `host.docker.internal:8000`.
+  If port 8000 is taken by something else on the host (as happened while building
+  this), or the API runs on a different port, the webhook silently can't reach it -
+  MinIO logs the delivery failure but there's no alert surfaced anywhere else.
+- **No dead-letter/retry visibility for missed webhook deliveries** — if
+  `/storage/events` is down when an object lands, that object is never retried or
+  flagged; the dataset simply never appears. Re-uploading the same object (or a
+  periodic reconciliation job) would be the only way to recover.
 
 ## Notes
 

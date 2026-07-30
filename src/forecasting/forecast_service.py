@@ -18,6 +18,7 @@ demo defaults, not calibrated capacity-planning guidance - tune them
 for a real environment.
 """
 
+import io
 import math
 from datetime import timedelta
 from pathlib import Path
@@ -198,6 +199,18 @@ class ForecastService:
             "label": f"Synthetic demo data ({n_servers} servers x {n_days} days)",
             "source": "built-in",
         }
+
+    @staticmethod
+    def read_tabular_bytes(filename: str, content: bytes) -> pd.DataFrame:
+        """Parse a .csv/.xlsx/.xls file's raw bytes into a DataFrame - shared by every
+        ingestion path (manual upload, the MinIO object-storage webhook) so they can
+        never silently drift apart on what file types/parsing they accept."""
+        lower = (filename or "").lower()
+        if lower.endswith((".xlsx", ".xls")):
+            return pd.read_excel(io.BytesIO(content))
+        if lower.endswith(".csv"):
+            return pd.read_csv(io.BytesIO(content))
+        raise ValueError(f"Unsupported file type for {filename!r} - expected .csv, .xlsx, or .xls.")
 
     def register_uploaded_dataset(self, dataset_id: str, df: pd.DataFrame, label: str | None = None) -> dict[str, Any]:
         missing = [c for c in REQUIRED_DATASET_COLUMNS if c not in df.columns]

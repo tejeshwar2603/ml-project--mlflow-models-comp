@@ -1,15 +1,16 @@
 import os
 import re
-import io
 import json
 import uuid
 import logging
 import threading
-from pathlib import Path
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from pathlib import Path, PurePosixPath
+from urllib.parse import unquote_plus
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import pandas as pd
+from . import object_storage
 from .chatbot import AIOpsChatbot, _llm_configured
 from .forecast_service import ForecastService
 from .rag import DEFAULT_VECTOR_STORE_PATH, build_vector_store_from_environment
@@ -233,6 +234,7 @@ def create_app(model_uri: str | None = None):
                 "datasets": "GET /datasets",
                 "upload_dataset": "POST /datasets/upload (multipart file: .xlsx/.xls/.csv) - now also trains + logs to MLflow automatically",
                 "train_dataset": "POST /datasets/{dataset_id}/train - retrigger training/MLflow/Airflow for an already-uploaded dataset",
+                "storage_events": "POST /storage/events - MinIO bucket-notification webhook target; not meant to be called directly",
             },
             "ui": "GET /ui",
         }
@@ -311,16 +313,11 @@ def create_app(model_uri: str | None = None):
         dataset_id: str | None = Form(None),
     ):
         content = await file.read()
-        filename = (file.filename or "uploaded").lower()
+        filename = file.filename or "uploaded"
         try:
-            if filename.endswith((".xlsx", ".xls")):
-                df = pd.read_excel(io.BytesIO(content))
-            elif filename.endswith(".csv"):
-                df = pd.read_csv(io.BytesIO(content))
-            else:
-                raise HTTPException(status_code=400, detail="Unsupported file type - upload .xlsx, .xls, or .csv.")
-        except HTTPException:
-            raise
+            df = forecast_service.read_tabular_bytes(filename, content)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
         except Exception as exc:
             raise HTTPException(status_code=400, detail=f"Could not read file: {exc}")
 
@@ -388,6 +385,54 @@ def create_app(model_uri: str | None = None):
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc))
         return _train_dataset_and_notify_airflow(target_dataset_id)
+
+    def _dataset_id_from_object_key(key: str) -> str:
+        # Deterministic per object path, not a random uuid - the same key landing
+        # again (a real-time feed overwriting the same object) should upsert the
+        # same dataset rather than minting a new one every time.
+        stem = PurePosixPath(key).stem
+        slug = re.sub(r"[^a-zA-Z0-9_-]+", "-", stem).strip("-").lower()
+        return f"minio-{slug}" if slug else f"minio-{uuid.uuid4().hex[:8]}"
+
+    @app.post("/storage/events")
+    async def storage_events(request: Request):
+        """Webhook target MinIO's bucket notification calls the instant an object is
+        created/overwritten in the configured bucket (see docker-compose.yml's
+        minio-init service, which wires the notification target + event binding).
+        Pulls the object's bytes back out via the S3 API and feeds them through the
+        exact same read_tabular_bytes() -> register_uploaded_dataset() path a manual
+        upload goes through - MinIO is a third source for one ingestion pipeline,
+        not a separate one."""
+        expected_token = os.getenv("MINIO_WEBHOOK_TOKEN")
+        if expected_token:
+            auth_header = request.headers.get("authorization", "")
+            if auth_header != f"Bearer {expected_token}":
+                raise HTTPException(status_code=401, detail="Invalid or missing webhook auth token.")
+
+        try:
+            body = await request.json()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid webhook payload: {exc}")
+
+        results = []
+        for record in body.get("Records") or []:
+            if not record.get("eventName", "").startswith("s3:ObjectCreated"):
+                continue
+            s3_info = record.get("s3", {})
+            bucket = s3_info.get("bucket", {}).get("name")
+            key = unquote_plus(s3_info.get("object", {}).get("key", ""))
+            if not bucket or not key:
+                continue
+            try:
+                content = object_storage.fetch_object(bucket, key)
+                df = forecast_service.read_tabular_bytes(key, content)
+                resolved_id = _dataset_id_from_object_key(key)
+                summary = forecast_service.register_uploaded_dataset(resolved_id, df, label=f"minio://{bucket}/{key}")
+                summary["training"] = _train_dataset_and_notify_airflow(resolved_id)
+                results.append({"bucket": bucket, "key": key, "dataset_id": resolved_id, "status": "ok", "summary": summary})
+            except Exception as exc:
+                results.append({"bucket": bucket, "key": key, "status": "error", "error": str(exc)})
+        return {"processed": len(results), "results": results}
 
     @app.post("/forecast")
     def forecast(request: ForecastRequest):

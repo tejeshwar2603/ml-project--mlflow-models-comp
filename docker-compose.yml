@@ -8,8 +8,57 @@ volumes:
   mlflowcomp-postgres-data:
   mlflowcomp-zk-data:
   mlflowcomp-kafka-data:
+  mlflowcomp-minio-data:
 
 services:
+  # ---------------- MinIO (S3-compatible object storage: 3rd dataset ingestion path) ----------------
+  # A .csv/.xlsx dropped into the bucket below triggers a bucket-notification webhook
+  # at POST /storage/events (see api.py) the instant it's created/overwritten - MinIO
+  # is a third source for the same ingestion pipeline manual upload and Kafka already
+  # feed, not a separate one. See ARCHITECTURE.md for the full flow.
+  minio:
+    image: minio/minio:latest
+    container_name: mlflowcomp-minio
+    networks: [mlflowcomp-net]
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+      # Notification target defined at startup via env vars, not `mc admin config
+      # set` + `mc admin service restart` at runtime - that restart needs an
+      # interactive TTY to confirm, which doesn't exist in a non-interactive
+      # init container. minio-init below only has to create the bucket and bind
+      # the event to this already-registered target - no restart required.
+      MINIO_NOTIFY_WEBHOOK_ENABLE_datasets: "on"
+      MINIO_NOTIFY_WEBHOOK_ENDPOINT_datasets: "http://host.docker.internal:8000/storage/events"
+      MINIO_NOTIFY_WEBHOOK_AUTH_TOKEN_datasets: ${MINIO_WEBHOOK_TOKEN:-changeme-webhook-token}
+    ports:
+      - "9010:9000" # S3 API (9000 is taken by an unrelated local MinIO instance)
+      - "9011:9001" # web console
+    volumes:
+      - mlflowcomp-minio-data:/data
+    command: server /data --console-address ":9001"
+    # The webhook it fires on object-create needs to reach the FastAPI app, which
+    # runs directly on the host (not in this compose stack) via `python run_api.py`.
+    # host.docker.internal resolves automatically on Docker Desktop (Windows/Mac);
+    # this extra_hosts entry is what makes the same thing work on Linux.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  minio-init:
+    image: minio/mc:latest
+    container_name: mlflowcomp-minio-init
+    networks: [mlflowcomp-net]
+    depends_on: [minio]
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        set -e
+        until mc alias set local http://minio:9000 minioadmin minioadmin; do sleep 2; done
+        mc mb -p local/cpu-utilization-datasets
+        mc event add local/cpu-utilization-datasets arn:minio:sqs::datasets:webhook --event put --suffix .csv || true
+        mc event add local/cpu-utilization-datasets arn:minio:sqs::datasets:webhook --event put --suffix .xlsx || true
+        echo "MinIO bucket 'cpu-utilization-datasets' + webhook notification configured."
   # ---------------- Kafka (single broker, simulated telemetry ingestion) ----------------
   zookeeper:
     image: confluentinc/cp-zookeeper:7.6.1
